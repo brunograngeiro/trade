@@ -19,21 +19,29 @@ class SignalConfig:
 
 
 class SignalEngine:
-    """Stateful signal detector. Feed ticks in chronological order."""
+    """Stateful signal detector. Feed ticks in chronological order.
+
+    Emits each (kind, side) combo at most once per market until `reset()` is
+    called. This is essential for live trading: a single explosion in late
+    phase produces hundreds of qualifying ticks if probability stays at the
+    extreme — we want a single actionable signal.
+    """
 
     def __init__(self, config: SignalConfig) -> None:
         self.config = config
         self._history: deque[Tick] = deque(maxlen=config.history_size)
         self._plateau_start: datetime | None = None
         self._plateau_side: Side | None = None
+        self._fired: set[tuple[str, str]] = set()
 
     def reset(self) -> None:
         self._history.clear()
         self._plateau_start = None
         self._plateau_side = None
+        self._fired.clear()
 
     def evaluate(self, tick: Tick, phase: MarketPhase) -> Signal:
-        """Append tick, update plateau state, emit best signal."""
+        """Append tick, update plateau state, emit best **new** signal."""
         self._history.append(tick)
         prob = tick.yes_mid
 
@@ -42,9 +50,18 @@ class SignalEngine:
 
         explosion = self._detect_explosion(tick, phase, prob)
         if explosion.kind == SignalKind.EXPLOSION:
-            return explosion
+            key = ("explosion", explosion.side.value)
+            if key not in self._fired:
+                self._fired.add(key)
+                return explosion
 
         plateau = self._detect_plateau(tick, phase, prob)
+        if plateau.kind == SignalKind.PLATEAU:
+            key = ("plateau", plateau.side.value)
+            if key not in self._fired:
+                self._fired.add(key)
+                return plateau
+            return self._none_signal(tick, phase, prob, 0.0, "plateau_already_fired")
         return plateau
 
     def _detect_explosion(self, tick: Tick, phase: MarketPhase, prob: float) -> Signal:

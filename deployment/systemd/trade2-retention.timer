@@ -1,0 +1,12 @@
+[Unit]
+Description=trade2 — daily data retention timer
+Requires=trade2-retention.service
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 UTC
+Persistent=true
+RandomizedDelaySec=600
+Unit=trade2-retention.service
+
+[Install]
+WantedBy=timers.target
