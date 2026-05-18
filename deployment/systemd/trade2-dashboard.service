@@ -1,0 +1,21 @@
+[Unit]
+Description=trade2 — Streamlit dashboard
+After=trade2-api.service
+Wants=trade2-api.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/trade2
+EnvironmentFile=/home/ubuntu/trade2/.env
+Environment=TRADE2_API_URL=http://127.0.0.1:8020
+ExecStart=/home/ubuntu/trade2/.venv/bin/streamlit run dashboard/app.py \
+  --server.port 8502 --server.address 0.0.0.0 --server.headless true --browser.gatherUsageStats false
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/ubuntu/trade2/data/dashboard.log
+StandardError=append:/home/ubuntu/trade2/data/dashboard.log
+
+[Install]
+WantedBy=multi-user.target

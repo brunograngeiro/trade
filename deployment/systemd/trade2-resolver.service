@@ -1,0 +1,19 @@
+[Unit]
+Description=trade2 — resolution sync (closed market outcomes)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/trade2
+EnvironmentFile=/home/ubuntu/trade2/.env
+ExecStart=/home/ubuntu/trade2/.venv/bin/python /home/ubuntu/trade2/scripts/run_resolution_sync.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/home/ubuntu/trade2/data/resolver.log
+StandardError=append:/home/ubuntu/trade2/data/resolver.log
+
+[Install]
+WantedBy=multi-user.target

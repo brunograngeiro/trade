@@ -1,0 +1,21 @@
+[Unit]
+Description=trade2 — FastAPI (Kalshi BTC 15min operator)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/trade2
+EnvironmentFile=/home/ubuntu/trade2/.env
+ExecStart=/home/ubuntu/trade2/.venv/bin/uvicorn app.api.main:app \
+  --host 0.0.0.0 --port 8020 --workers 1
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/ubuntu/trade2/data/api.log
+StandardError=append:/home/ubuntu/trade2/data/api.log
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

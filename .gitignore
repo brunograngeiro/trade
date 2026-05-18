@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.*
+!.env.example
+secrets/
+data/*.sqlite3*
+data/*.db*
+data/*.log
+.streamlit/secrets.toml
+.pytest_cache/
+.ruff_cache/
+*.log
