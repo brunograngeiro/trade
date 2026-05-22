@@ -461,7 +461,7 @@ with tabs[2]:
 
 with tabs[3]:
     st.subheader("Analyst")
-    st.caption("Um chat para código, estratégia e dados. As conversas ficam salvas.")
+    st.caption("Um chat para código, estratégia e dados. Relatórios prontos: trades hoje, minuto final, spot walk-forward, radar, risco.")
 
     provider = st.selectbox("Provider", ["openai", "deepseek", "xai"], index=0, key="analyst_provider")
     if "analyst_conversation_id" not in st.session_state:

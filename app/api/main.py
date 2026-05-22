@@ -26,8 +26,10 @@ from app.application.analytics import (
     analyst_context,
     compact_rows,
     final_minute_probability_stats,
+    project_context,
     readonly_query,
     schema_summary,
+    spot_probability_walk_forward,
 )
 from app.application.decision import StrategyDecision
 from app.application.llm import LLMClient, LLMError
@@ -334,6 +336,15 @@ async def analytics_final_minute() -> dict:
     return final_minute_probability_stats(_state(app).settings.db_path)
 
 
+@app.get("/analytics/spot-walk-forward")
+async def analytics_spot_walk_forward(folds: int = 4, max_ttc_seconds: float = 180.0) -> dict:
+    return spot_probability_walk_forward(
+        _state(app).settings.db_path,
+        folds=max(1, min(folds, 12)),
+        max_ttc_seconds=max(15.0, min(max_ttc_seconds, 900.0)),
+    )
+
+
 @app.post("/analytics/query")
 async def analytics_query(body: dict) -> dict:
     sql = str(body.get("sql") or "")
@@ -471,6 +482,36 @@ async def analytics_chat(body: dict) -> dict:
     s = _state(app)
     s.db.save_analyst_message(conversation_id, "user", question, provider=provider)
 
+    report = _preprogrammed_report(question, s.settings)
+    if report is not None:
+        report_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Voce e o analista do projeto trade2. Resuma o relatorio pre-programado "
+                    "em portugues, com conclusoes praticas e ressalvas. Seja direto."
+                ),
+            },
+            {"role": "user", "content": f"Pergunta: {question}\nRelatorio: {report}"},
+        ]
+        try:
+            summary = await LLMClient(s.settings).chat(provider, report_messages, max_tokens=800)
+        except LLMError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        answer = summary["content"]
+        metadata = f"{summary.get('model')} | report={report['name']}"
+        s.db.save_analyst_message(conversation_id, "assistant", answer,
+                                  provider=provider, metadata=metadata)
+        return {
+            "conversation_id": conversation_id,
+            "provider": provider,
+            "model": metadata,
+            "answer": answer,
+            "sql": None,
+            "rows": report["data"].get("folds") or report["data"].get("rows") or [],
+            "columns": [],
+        }
+
     root = Path(__file__).resolve().parents[2]
     schema = schema_summary(s.settings.db_path)
     code_context = analyst_context(s.settings.db_path, question, root)
@@ -492,7 +533,10 @@ async def analytics_chat(body: dict) -> dict:
                 "Para trades por data use orders.submitted_at e join com trade_outcomes."
             ),
         },
-        {"role": "system", "content": f"Schema:\n{schema}\n\nContexto de codigo:\n{code_context}\n\nHistorico:\n{history}"},
+        {"role": "system", "content": (
+            f"Contexto fixo do projeto:\n{project_context()}\n\n"
+            f"Schema:\n{schema}\n\nContexto de codigo:\n{code_context}\n\nHistorico:\n{history}"
+        )},
         {"role": "user", "content": question},
     ]
     try:
@@ -562,6 +606,23 @@ def _parse_chat_decision(content: str) -> dict:
     except json.JSONDecodeError:
         pass
     return {"mode": "answer", "answer": content}
+
+
+def _preprogrammed_report(question: str, settings) -> dict | None:
+    q = question.lower()
+    if "spot" in q and ("walk" in q or "correla" in q or "correlac" in q):
+        return {
+            "mode": "report",
+            "name": "spot_walk_forward",
+            "data": spot_probability_walk_forward(settings.db_path, folds=4, max_ttc_seconds=180.0),
+        }
+    if "minuto final" in q or "60s finais" in q or "probabilidades finais" in q:
+        return {
+            "mode": "report",
+            "name": "final_minute",
+            "data": final_minute_probability_stats(settings.db_path),
+        }
+    return None
 
 
 @app.get("/analytics/conversations")
