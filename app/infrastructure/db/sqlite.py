@@ -513,7 +513,8 @@ class Database:
             rows = conn.execute(
                 """SELECT o.id, o.submitted_at, o.ticker, o.side, o.count,
                           o.limit_price_cents, o.dry_run, o.ok,
-                          t.resolution, t.realized_pnl_dollars, t.fees_paid_dollars
+                          t.entry_price_cents, t.resolution,
+                          t.realized_pnl_dollars, t.fees_paid_dollars
                    FROM orders o
                    LEFT JOIN trade_outcomes t ON t.order_id = o.id
                    WHERE o.dry_run = 0 AND o.ok = 1 AND o.action = 'buy'

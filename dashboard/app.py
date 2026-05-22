@@ -507,6 +507,53 @@ with tabs[3]:
 # -------------------- Trades --------------------
 
 with tabs[4]:
+    outcomes = _get("/portfolio/outcomes?limit=300").get("outcomes", [])
+    if outcomes:
+        trades = pd.DataFrame(outcomes)
+        trades["submitted_at"] = pd.to_datetime(trades["submitted_at"])
+        trades["resolved"] = trades["realized_pnl_dollars"].notna()
+        trades["entry_price_cents"] = trades["entry_price_cents"].fillna(
+            trades["limit_price_cents"]
+        )
+        resolved = trades[trades["resolved"]].copy()
+        wins = int((resolved["realized_pnl_dollars"] > 0).sum()) if not resolved.empty else 0
+        pnl = float(resolved["realized_pnl_dollars"].sum()) if not resolved.empty else 0.0
+        fees = float(resolved["fees_paid_dollars"].fillna(0).sum()) if not resolved.empty else 0.0
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Trades reais", len(trades))
+        m2.metric("Resolvidos", len(resolved))
+        m3.metric("Win rate", f"{wins / len(resolved) * 100:.1f}%" if len(resolved) else "-")
+        m4.metric("PnL realizado", f"${pnl:+.2f}")
+        m5.metric("Fees", f"${fees:.2f}")
+
+        display = trades[[
+            "submitted_at", "ticker", "side", "count", "entry_price_cents",
+            "limit_price_cents", "resolution", "realized_pnl_dollars",
+            "fees_paid_dollars",
+        ]].copy()
+        display = display.rename(columns={
+            "submitted_at": "hora",
+            "entry_price_cents": "entrada_cents",
+            "limit_price_cents": "limite_cents",
+            "realized_pnl_dollars": "pnl_usd",
+            "fees_paid_dollars": "fees_usd",
+        })
+        st.dataframe(
+            display,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "pnl_usd": st.column_config.NumberColumn("pnl_usd", format="$%.2f"),
+                "fees_usd": st.column_config.NumberColumn("fees_usd", format="$%.3f"),
+            },
+        )
+        st.caption("Trades reais mostram apenas entradas buy; exits/sells entram no PnL quando há fill.")
+    else:
+        st.info("Nenhum trade real preenchido ainda.")
+
+    st.divider()
+    st.subheader("Ordens enviadas")
     orders = _get("/orders/recent?limit=200").get("orders", [])
     if orders:
         df = pd.DataFrame(orders)
