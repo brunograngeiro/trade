@@ -93,7 +93,7 @@ def test_persistent_probability_skips_outside_final_window() -> None:
 def test_late_50_cross_flips_existing_position() -> None:
     t0 = datetime(2026, 5, 18, 12, tzinfo=timezone.utc)
     engine = SignalEngine(SignalConfig())
-    decisions = DecisionEngine(DecisionConfig(entry_persistence_seconds=0))
+    decisions = DecisionEngine(DecisionConfig(entry_persistence_seconds=0, flip_enabled=True))
     market = _market(t0)
 
     tick1 = _tick(0.65, t0)
@@ -118,6 +118,7 @@ def test_exit_carries_previous_side_and_close_limit_price() -> None:
     decisions = DecisionEngine(DecisionConfig(
         entry_persistence_seconds=0,
         exit_warn_confidence=0.55,
+        exit_confirmation_seconds=0,
     ))
     market = _market(t0)
 
@@ -147,6 +148,7 @@ def test_flip_below_confidence_floor_exits_without_reentering() -> None:
     decisions = DecisionEngine(DecisionConfig(
         entry_persistence_seconds=0,
         entry_confidence_floor=0.60,
+        flip_enabled=True,
     ))
     market = _market(t0)
 
@@ -169,6 +171,143 @@ def test_flip_below_confidence_floor_exits_without_reentering() -> None:
     drift = decisions.evaluate(drift_tick, market, drift_signal, 95)
     # Confidence on held NO side = 0.58, still above exit_warn (0.55) -> HOLD.
     assert drift.action == DecisionAction.HOLD
+
+
+def test_late_50_cross_waits_for_confirmation_when_confidence_is_soft() -> None:
+    t0 = datetime(2026, 5, 18, 12, tzinfo=timezone.utc)
+    engine = SignalEngine(SignalConfig())
+    decisions = DecisionEngine(DecisionConfig(entry_persistence_seconds=999))
+    market = _market(t0)
+
+    seed = _tick(0.65, t0)
+    seed_signal = engine.evaluate(seed, MarketPhase.LATE, 170)
+    assert decisions.evaluate(seed, market, seed_signal, 170).action == DecisionAction.SKIP
+
+    cross = _tick(0.38, t0 + timedelta(seconds=5))
+    cross_signal = engine.evaluate(cross, MarketPhase.LATE, 165)
+    first = decisions.evaluate(cross, market, cross_signal, 165)
+
+    assert first.action == DecisionAction.SKIP
+    assert first.reason == "late_50_cross_waiting_confirmation_0s"
+    assert first.crossed_50 is True
+
+    confirmed = _tick(0.38, t0 + timedelta(seconds=16))
+    confirmed_signal = engine.evaluate(confirmed, MarketPhase.LATE, 154)
+    second = decisions.evaluate(confirmed, market, confirmed_signal, 154)
+
+    assert second.action == DecisionAction.ENTER
+    assert second.side == Side.NO
+    assert second.reason == "late_50_cross_confirmed_11s"
+
+
+def test_late_50_cross_enters_immediately_when_confidence_is_strong() -> None:
+    t0 = datetime(2026, 5, 18, 12, tzinfo=timezone.utc)
+    engine = SignalEngine(SignalConfig())
+    decisions = DecisionEngine(DecisionConfig(entry_persistence_seconds=999))
+    market = _market(t0)
+
+    seed = _tick(0.65, t0)
+    seed_signal = engine.evaluate(seed, MarketPhase.LATE, 170)
+    decisions.evaluate(seed, market, seed_signal, 170)
+
+    cross = _tick(0.29, t0 + timedelta(seconds=5))
+    cross_signal = engine.evaluate(cross, MarketPhase.LATE, 165)
+    decision = decisions.evaluate(cross, market, cross_signal, 165)
+
+    assert decision.action == DecisionAction.ENTER
+    assert decision.side == Side.NO
+    assert decision.reason == "late_50_cross_strong_confidence"
+
+
+def test_late_50_cross_final_minute_requires_very_high_confidence() -> None:
+    t0 = datetime(2026, 5, 18, 12, tzinfo=timezone.utc)
+    engine = SignalEngine(SignalConfig())
+    decisions = DecisionEngine(DecisionConfig(entry_persistence_seconds=999))
+    market = _market(t0)
+
+    seed = _tick(0.65, t0)
+    seed_signal = engine.evaluate(seed, MarketPhase.LATE, 70)
+    decisions.evaluate(seed, market, seed_signal, 70)
+
+    soft_cross = _tick(0.22, t0 + timedelta(seconds=5))
+    soft_signal = engine.evaluate(soft_cross, MarketPhase.LATE, 55)
+    soft = decisions.evaluate(soft_cross, market, soft_signal, 55)
+    assert soft.action == DecisionAction.SKIP
+    assert soft.reason == "late_cross_final_needs_85c"
+
+    decisions.reset()
+    seed_signal = engine.evaluate(seed, MarketPhase.LATE, 70)
+    decisions.evaluate(seed, market, seed_signal, 70)
+    hard_cross = _tick(0.12, t0 + timedelta(seconds=5))
+    hard_signal = engine.evaluate(hard_cross, MarketPhase.LATE, 55)
+    hard = decisions.evaluate(hard_cross, market, hard_signal, 55)
+    assert hard.action == DecisionAction.ENTER
+    assert hard.reason == "late_50_cross_final_high_confidence"
+
+
+def test_exit_waits_for_confirmation_when_confidence_drops_without_cross() -> None:
+    t0 = datetime(2026, 5, 18, 12, tzinfo=timezone.utc)
+    engine = SignalEngine(SignalConfig())
+    decisions = DecisionEngine(DecisionConfig(entry_persistence_seconds=0))
+    market = _market(t0)
+
+    enter_tick = _tick(0.65, t0)
+    enter_signal = engine.evaluate(enter_tick, MarketPhase.LATE, 120)
+    assert decisions.evaluate(enter_tick, market, enter_signal, 120).action == DecisionAction.ENTER
+    decisions.set_position(Side.YES)
+
+    drop_tick = _tick(0.46, t0 + timedelta(seconds=5))
+    drop_signal = engine.evaluate(drop_tick, MarketPhase.LATE, 115)
+    first = decisions.evaluate(drop_tick, market, drop_signal, 115)
+    assert first.action == DecisionAction.HOLD
+    assert first.reason == "exit_waiting_confirmation_0s_confidence_0.46"
+
+    confirmed_tick = _tick(0.46, t0 + timedelta(seconds=16))
+    confirmed_signal = engine.evaluate(confirmed_tick, MarketPhase.LATE, 104)
+    second = decisions.evaluate(confirmed_tick, market, confirmed_signal, 104)
+    assert second.action == DecisionAction.EXIT
+    assert second.previous_side == Side.YES
+    assert second.reason == "position_confidence_dropped_to_0.46_confirmed"
+
+
+def test_exit_is_blocked_in_last_five_seconds() -> None:
+    t0 = datetime(2026, 5, 18, 12, tzinfo=timezone.utc)
+    engine = SignalEngine(SignalConfig())
+    decisions = DecisionEngine(DecisionConfig(entry_persistence_seconds=0))
+    market = _market(t0)
+
+    enter_tick = _tick(0.65, t0)
+    enter_signal = engine.evaluate(enter_tick, MarketPhase.LATE, 120)
+    assert decisions.evaluate(enter_tick, market, enter_signal, 120).action == DecisionAction.ENTER
+    decisions.set_position(Side.YES)
+
+    final_tick = _tick(0.30, t0 + timedelta(seconds=118))
+    final_signal = engine.evaluate(final_tick, MarketPhase.LATE, 2)
+    decision = decisions.evaluate(final_tick, market, final_signal, 2)
+
+    assert decision.action == DecisionAction.HOLD
+    assert decision.reason == "position_near_close_no_exit"
+
+
+def test_flip_disabled_exits_without_reentering_on_cross() -> None:
+    t0 = datetime(2026, 5, 18, 12, tzinfo=timezone.utc)
+    engine = SignalEngine(SignalConfig())
+    decisions = DecisionEngine(DecisionConfig(entry_persistence_seconds=0, flip_enabled=False))
+    market = _market(t0)
+
+    enter_tick = _tick(0.65, t0)
+    enter_signal = engine.evaluate(enter_tick, MarketPhase.LATE, 120)
+    assert decisions.evaluate(enter_tick, market, enter_signal, 120).action == DecisionAction.ENTER
+    decisions.set_position(Side.YES)
+
+    cross_tick = _tick(0.30, t0 + timedelta(seconds=10))
+    cross_signal = engine.evaluate(cross_tick, MarketPhase.LATE, 110)
+    decision = decisions.evaluate(cross_tick, market, cross_signal, 110)
+
+    assert decision.action == DecisionAction.EXIT
+    assert decision.side == Side.YES
+    assert decision.previous_side == Side.YES
+    assert decision.reason == "50_cross_exit_flip_disabled_yes"
 
 
 def test_crossed_50_hysteresis_ignores_noise_inside_indecision_band() -> None:

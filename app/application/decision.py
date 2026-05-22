@@ -25,8 +25,15 @@ class DecisionConfig:
     entry_persistence_seconds: float = 20.0
     entry_ttc_seconds: float = 180.0
     late_cross_ttc_seconds: float = 180.0
+    late_cross_confirmation_seconds: float = 10.0
+    late_cross_strong_confidence: float = 0.70
+    late_cross_final_ttc_seconds: float = 60.0
+    late_cross_final_confidence: float = 0.85
     flip_cross_ttc_seconds: float = 180.0
+    flip_enabled: bool = False
     exit_warn_confidence: float = 0.55
+    exit_confirmation_seconds: float = 10.0
+    min_exit_ttc_seconds: float = 5.0
     extreme_close_ttc_seconds: float = 60.0
     max_entry_price_180s_cents: int = 72
     max_entry_price_60s_cents: int = 92
@@ -67,6 +74,10 @@ class DecisionEngine:
         self._last_side: Side | None = None
         self._support_side: Side | None = None
         self._support_start: datetime | None = None
+        self._pending_cross_side: Side | None = None
+        self._pending_cross_start: datetime | None = None
+        self._exit_warning_side: Side | None = None
+        self._exit_warning_start: datetime | None = None
         self._position_side: Side | None = None
         self._spot_history: deque[tuple[datetime, float]] = deque(maxlen=1200)
         # Spot at the start of the current 15-min window. KXBTC15M is a
@@ -81,6 +92,10 @@ class DecisionEngine:
         self._last_side = None
         self._support_side = None
         self._support_start = None
+        self._pending_cross_side = None
+        self._pending_cross_start = None
+        self._exit_warning_side = None
+        self._exit_warning_start = None
         self._position_side = None
         self._spot_history.clear()
         self._spot_at_open = None
@@ -131,6 +146,7 @@ class DecisionEngine:
             )
 
         if confidence < self.config.entry_confidence_floor:
+            self._clear_pending_cross()
             return self._decision(tick, DecisionAction.SKIP, side, prob, ttc_seconds,
                                   limit_price, "inside_40_60_no_trade", signal,
                                   crossed_50=crossed_50)
@@ -158,16 +174,19 @@ class DecisionEngine:
             )
 
         if signal.kind == SignalKind.EXTREME_CLOSE:
+            self._clear_pending_cross()
             return self._decision(tick, DecisionAction.ENTER, side, prob, ttc_seconds,
                                   limit_price, "extreme_close_calibrated_entry",
                                   signal, crossed_50=crossed_50)
 
-        if crossed_50 and self._inside_ttc(ttc_seconds, self.config.late_cross_ttc_seconds):
-            return self._decision(tick, DecisionAction.ENTER, side, prob, ttc_seconds,
-                                  limit_price, "late_50_cross_entry",
-                                  signal, crossed_50=True)
+        late_cross = self._late_cross_decision(
+            tick, signal, ttc_seconds, side, prob, confidence, limit_price, crossed_50
+        )
+        if late_cross is not None:
+            return late_cross
 
         if supported_seconds >= self.config.entry_persistence_seconds:
+            self._clear_pending_cross()
             return self._decision(
                 tick, DecisionAction.ENTER, side, prob, ttc_seconds, limit_price,
                 f"persistent_{side.value}_{int(supported_seconds)}s", signal,
@@ -186,20 +205,30 @@ class DecisionEngine:
         prob = tick.yes_mid
         assert self._position_side is not None
 
+        if self._inside_ttc(ttc_seconds, self.config.min_exit_ttc_seconds):
+            self._clear_exit_warning()
+            return self._decision(tick, DecisionAction.HOLD, self._position_side, prob,
+                                  ttc_seconds, limit_price, "position_near_close_no_exit",
+                                  signal, crossed_50=crossed_50)
+
         if market_side != self._position_side and crossed_50:
             old_side = self._position_side
+            self._clear_exit_warning()
             # FLIP requires the same confidence floor as a fresh ENTER — we
             # don't pivot into a barely-better-than-coin-flip side. Below the
             # floor we still close the losing leg (EXIT) but skip the re-entry.
             confident_enough = confidence >= self.config.entry_confidence_floor
-            if (confident_enough
+            if (self.config.flip_enabled
+                    and confident_enough
                     and self._inside_ttc(ttc_seconds, self.config.flip_cross_ttc_seconds)):
                 return self._decision(
                     tick, DecisionAction.FLIP, market_side, prob, ttc_seconds, limit_price,
                     f"late_50_cross_against_{old_side.value}", signal,
                     crossed_50=True, previous_side=old_side,
                 )
-            reason = (f"50_cross_invalidated_{old_side.value}" if confident_enough
+            reason = (f"50_cross_exit_flip_disabled_{old_side.value}"
+                      if confident_enough and not self.config.flip_enabled
+                      else f"50_cross_invalidated_{old_side.value}" if confident_enough
                       else f"50_cross_low_confidence_{confidence:.2f}_exit_{old_side.value}")
             return self._decision(
                 tick, DecisionAction.EXIT, old_side, prob, ttc_seconds, limit_price,
@@ -209,15 +238,96 @@ class DecisionEngine:
         position_confidence = prob if self._position_side == Side.YES else 1.0 - (prob or 0.5)
         if position_confidence < self.config.exit_warn_confidence:
             old_side = self._position_side
+            if self._exit_warning_side != old_side or self._exit_warning_start is None:
+                self._exit_warning_side = old_side
+                self._exit_warning_start = tick.captured_at
+            warning_seconds = max(
+                0.0, (tick.captured_at - self._exit_warning_start).total_seconds()
+            )
+            if warning_seconds < self.config.exit_confirmation_seconds:
+                return self._decision(
+                    tick, DecisionAction.HOLD, old_side, prob, ttc_seconds, limit_price,
+                    f"exit_waiting_confirmation_{int(warning_seconds)}s_confidence_{position_confidence:.2f}",
+                    signal, crossed_50=crossed_50,
+                )
+            self._clear_exit_warning()
             return self._decision(
                 tick, DecisionAction.EXIT, old_side, prob, ttc_seconds, limit_price,
-                f"position_confidence_dropped_to_{position_confidence:.2f}",
+                f"position_confidence_dropped_to_{position_confidence:.2f}_confirmed",
                 signal, crossed_50=crossed_50, previous_side=old_side,
             )
 
+        self._clear_exit_warning()
         return self._decision(tick, DecisionAction.HOLD, self._position_side, prob,
                               ttc_seconds, limit_price, "position_still_valid",
                               signal, crossed_50=crossed_50)
+
+    def _late_cross_decision(self, tick: Tick, signal: Signal, ttc_seconds: float | None,
+                             side: Side, prob: float, confidence: float,
+                             limit_price: int | None,
+                             crossed_50: bool) -> StrategyDecision | None:
+        if not self._inside_ttc(ttc_seconds, self.config.late_cross_ttc_seconds):
+            self._clear_pending_cross()
+            return None
+
+        in_final_minute = self._inside_ttc(ttc_seconds, self.config.late_cross_final_ttc_seconds)
+
+        if crossed_50:
+            self._pending_cross_side = side
+            self._pending_cross_start = tick.captured_at
+            if in_final_minute:
+                if confidence >= self.config.late_cross_final_confidence:
+                    self._clear_pending_cross()
+                    return self._decision(
+                        tick, DecisionAction.ENTER, side, prob, ttc_seconds, limit_price,
+                        "late_50_cross_final_high_confidence", signal, crossed_50=True,
+                    )
+                return self._decision(
+                    tick, DecisionAction.SKIP, side, prob, ttc_seconds, limit_price,
+                    f"late_cross_final_needs_{int(self.config.late_cross_final_confidence * 100)}c",
+                    signal, crossed_50=True,
+                )
+            if confidence >= self.config.late_cross_strong_confidence:
+                self._clear_pending_cross()
+                return self._decision(
+                    tick, DecisionAction.ENTER, side, prob, ttc_seconds, limit_price,
+                    "late_50_cross_strong_confidence", signal, crossed_50=True,
+                )
+            return self._decision(
+                tick, DecisionAction.SKIP, side, prob, ttc_seconds, limit_price,
+                "late_50_cross_waiting_confirmation_0s", signal, crossed_50=True,
+            )
+
+        if self._pending_cross_side != side or self._pending_cross_start is None:
+            return None
+
+        pending_seconds = max(
+            0.0, (tick.captured_at - self._pending_cross_start).total_seconds()
+        )
+        if in_final_minute:
+            if confidence >= self.config.late_cross_final_confidence:
+                self._clear_pending_cross()
+                return self._decision(
+                    tick, DecisionAction.ENTER, side, prob, ttc_seconds, limit_price,
+                    "late_50_cross_final_high_confidence", signal, crossed_50=False,
+                )
+            return self._decision(
+                tick, DecisionAction.SKIP, side, prob, ttc_seconds, limit_price,
+                f"late_cross_final_needs_{int(self.config.late_cross_final_confidence * 100)}c",
+                signal, crossed_50=False,
+            )
+        if pending_seconds >= self.config.late_cross_confirmation_seconds:
+            self._clear_pending_cross()
+            return self._decision(
+                tick, DecisionAction.ENTER, side, prob, ttc_seconds, limit_price,
+                f"late_50_cross_confirmed_{int(pending_seconds)}s",
+                signal, crossed_50=False,
+            )
+        return self._decision(
+            tick, DecisionAction.SKIP, side, prob, ttc_seconds, limit_price,
+            f"late_50_cross_waiting_confirmation_{int(pending_seconds)}s",
+            signal, crossed_50=False,
+        )
 
     def _record_spot(self, spot_price: float | None, when: datetime) -> None:
         if spot_price is None:
@@ -296,6 +406,14 @@ class DecisionEngine:
         if self._support_side != side or self._support_start is None:
             return 0.0
         return max(0.0, (when - self._support_start).total_seconds())
+
+    def _clear_pending_cross(self) -> None:
+        self._pending_cross_side = None
+        self._pending_cross_start = None
+
+    def _clear_exit_warning(self) -> None:
+        self._exit_warning_side = None
+        self._exit_warning_start = None
 
     def _entry_price_cents(self, tick: Tick, side: Side) -> int | None:
         price = tick.yes_ask if side == Side.YES else tick.no_ask
