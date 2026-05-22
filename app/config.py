@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     default_order_count: int = Field(default=1, alias="DEFAULT_ORDER_COUNT")
     strategy_real_order_cap: int = Field(default=0, alias="STRATEGY_REAL_ORDER_CAP")
     strategy_real_order_cap_since: str = Field(default="", alias="STRATEGY_REAL_ORDER_CAP_SINCE")
+    risk_manager_enabled: bool = Field(default=True, alias="RISK_MANAGER_ENABLED")
+    risk_max_balance_fraction: float = Field(default=0.50, alias="RISK_MAX_BALANCE_FRACTION")
+    risk_max_daily_trades: int = Field(default=10, alias="RISK_MAX_DAILY_TRADES")
+    risk_max_daily_loss_dollars: float = Field(default=6.0, alias="RISK_MAX_DAILY_LOSS_DOLLARS")
+    risk_max_consecutive_losses: int = Field(default=3, alias="RISK_MAX_CONSECUTIVE_LOSSES")
 
     prob_explosion_delta: float = Field(default=0.20, alias="PROB_EXPLOSION_DELTA")
     prob_plateau_threshold: float = Field(default=0.99, alias="PROB_PLATEAU_THRESHOLD")

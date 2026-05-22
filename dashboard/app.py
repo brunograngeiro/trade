@@ -216,7 +216,7 @@ def calibration_stats(db_path: str) -> dict:
     }
 
 
-tabs = st.tabs(["Live", "Portfolio", "Radar", "Sinais", "Trades", "Backtest"])
+tabs = st.tabs(["Live", "Portfolio", "Risk", "Analyst", "Radar", "Sinais", "Trades", "Backtest"])
 
 
 # -------------------- Live --------------------
@@ -415,9 +415,92 @@ with tabs[1]:
             st.caption("Nenhum trade real registrado ainda.")
 
 
-# -------------------- Radar --------------------
+# -------------------- Risk --------------------
 
 with tabs[2]:
+    st.subheader("Gerenciamento de risco")
+    risk = _get("/risk/status", timeout=10)
+    if "_error" in risk:
+        st.error(risk["_error"])
+    else:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Saldo", f"${risk.get('balance_dollars', 0):.2f}")
+        m2.metric(
+            "Risco máximo",
+            f"${risk.get('max_risk_dollars', 0):.2f}",
+            f"{risk.get('max_balance_fraction', 0) * 100:.0f}% do saldo",
+        )
+        m3.metric(
+            "Risco aberto",
+            f"${risk.get('open_risk_dollars', 0):.2f}",
+            f"{risk.get('risk_used_fraction', 0) * 100:.1f}% usado",
+        )
+        m4.metric("PnL diário", f"${risk.get('daily_realized_pnl_dollars', 0):+.2f}")
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Trades hoje", risk.get("trades_today", 0),
+                  f"máx {risk.get('max_daily_trades', 0)}")
+        c2.metric("Loss streak", risk.get("consecutive_losses", 0),
+                  f"máx {risk.get('max_consecutive_losses', 0)}")
+        c3.metric("Loss diário máximo", f"${risk.get('max_daily_loss_dollars', 0):.2f}")
+
+        last = risk.get("last_check")
+        if last:
+            st.caption(f"Último check: {last.get('reason')} / approved={last.get('approved')}")
+
+        open_trades = risk.get("open_trades") or []
+        if open_trades:
+            st.subheader("Risco aberto por trade")
+            odf = pd.DataFrame(open_trades)
+            st.dataframe(odf, use_container_width=True, hide_index=True)
+        else:
+            st.caption("Nenhum trade real aberto contabilizado pelo risk manager.")
+
+
+# -------------------- Analyst --------------------
+
+with tabs[3]:
+    st.subheader("Analyst")
+    st.caption("Consultas estatísticas read-only. A integração com LLM deve gerar SQL apenas dentro deste limite.")
+    if st.button("Probabilidades no minuto final", key="final_minute_stats"):
+        stats = _get("/analytics/final-minute", timeout=20)
+        st.metric("Mercados analisados", stats.get("markets", 0))
+        if stats.get("rows"):
+            adf = pd.DataFrame(stats["rows"])
+            st.dataframe(
+                adf,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "avg_yes_prob": st.column_config.NumberColumn("YES médio", format="%.3f"),
+                    "avg_confidence": st.column_config.NumberColumn("Confiança média", format="%.3f"),
+                    "direction_accuracy": st.column_config.NumberColumn("Acerto direção", format="%.1%"),
+                    "pct_near_50": st.column_config.NumberColumn("Perto de 50%", format="%.1%"),
+                },
+            )
+
+    st.divider()
+    default_sql = """SELECT ticker, submitted_at, side, limit_price_cents
+FROM orders
+WHERE dry_run = 0
+ORDER BY submitted_at DESC"""
+    sql = st.text_area("SQL read-only", value=default_sql, height=130)
+    if st.button("Executar consulta", key="run_readonly_sql"):
+        try:
+            r = requests.post(f"{API_URL}/analytics/query", json={"sql": sql, "limit": 300}, timeout=20)
+            if r.status_code >= 400:
+                st.error(r.text)
+            else:
+                payload = r.json()
+                st.dataframe(pd.DataFrame(payload.get("rows", [])),
+                             use_container_width=True, hide_index=True)
+        except Exception as exc:  # noqa: BLE001
+            st.error(str(exc))
+
+
+# -------------------- Radar --------------------
+
+with tabs[4]:
     st.subheader("Radar semi-automático")
     st.caption("Snapshot diário de mercados com volume/liquidez, spread aceitável e deadline próximo. Observação apenas.")
     if st.button("Refresh", key="refresh_radar"):
@@ -504,7 +587,7 @@ with tabs[2]:
 
 # -------------------- Sinais --------------------
 
-with tabs[3]:
+with tabs[5]:
     signals = _get("/signals/recent?limit=200").get("signals", [])
     if signals:
         df = pd.DataFrame(signals)
@@ -520,7 +603,7 @@ with tabs[3]:
 
 # -------------------- Trades --------------------
 
-with tabs[4]:
+with tabs[6]:
     outcomes = _get("/portfolio/outcomes?limit=300").get("outcomes", [])
     if outcomes:
         trades = pd.DataFrame(outcomes)
@@ -587,7 +670,7 @@ with tabs[4]:
 
 # -------------------- Backtest --------------------
 
-with tabs[5]:
+with tabs[7]:
     st.subheader("Backtest single-run (fee-aware)")
     c1, c2, c3, c4 = st.columns(4)
     delta = c1.slider("Explosion Δ", 0.05, 0.40, SETTINGS.prob_explosion_delta, 0.01)

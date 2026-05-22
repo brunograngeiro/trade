@@ -19,9 +19,11 @@ from app.api.schemas import (
 )
 from app.api.state import AppState
 from app.application.collector import Collector
+from app.application.analytics import final_minute_probability_stats, readonly_query
 from app.application.decision import StrategyDecision
 from app.application.market_scanner import MarketScanner
 from app.application.order_gateway import OrderGateway
+from app.application.risk import RiskManager
 from app.config import get_settings
 from app.domain.entities import Market, Side, Signal, Tick
 from app.infrastructure.coinbase.client import CoinbaseClient
@@ -108,12 +110,18 @@ async def lifespan(app: FastAPI):
                         dry_run=dry_run,
                         time_in_force="immediate_or_cancel",
                     )
-                    buy_result = await state.orders.submit(buy_req)
-                    order_results.append(buy_result)
-                    if _order_filled(buy_result):
-                        state.collector.decisions.set_position(decision.side)
-                    else:
+                    risk_check = await state.risk.approve_entry(buy_req)
+                    if not risk_check.approved:
+                        log.info("Risk blocked buy for %s: %s",
+                                 decision.ticker, risk_check.reason)
                         state.collector.decisions.set_position(None)
+                    else:
+                        buy_result = await state.orders.submit(buy_req)
+                        order_results.append(buy_result)
+                        if _order_filled(buy_result):
+                            state.collector.decisions.set_position(decision.side)
+                        else:
+                            state.collector.decisions.set_position(None)
 
             if action == "exit" and order_results:
                 close_result = order_results[-1]
@@ -148,7 +156,9 @@ async def lifespan(app: FastAPI):
     if settings.dry_run_market_scanner_enabled:
         scanner = MarketScanner(settings, client, db, coinbase=coinbase)
     orders = OrderGateway(settings, client, db)
-    state = AppState(settings=settings, client=client, db=db, collector=collector, orders=orders)
+    risk = RiskManager(settings, db, client)
+    state = AppState(settings=settings, client=client, db=db, collector=collector,
+                     orders=orders, risk=risk)
     state.scanner = scanner
     app.state.runtime = state
 
@@ -302,6 +312,26 @@ async def market_radar_recent(limit: int = 100) -> dict:
 @app.get("/markets/radar/history")
 async def market_radar_history(limit: int = 1000) -> dict:
     return {"candidates": _state(app).db.market_radar_history(limit=limit)}
+
+
+@app.get("/risk/status")
+async def risk_status() -> dict:
+    return await _state(app).risk.status()
+
+
+@app.get("/analytics/final-minute")
+async def analytics_final_minute() -> dict:
+    return final_minute_probability_stats(_state(app).settings.db_path)
+
+
+@app.post("/analytics/query")
+async def analytics_query(body: dict) -> dict:
+    sql = str(body.get("sql") or "")
+    limit = int(body.get("limit") or 300)
+    try:
+        return readonly_query(_state(app).settings.db_path, sql, limit=max(1, min(limit, 1000)))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/orders/recent")

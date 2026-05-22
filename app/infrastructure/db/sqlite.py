@@ -451,6 +451,80 @@ class Database:
             ).fetchone()
         return int(row["n"] if row else 0)
 
+    def has_open_real_trade(self, ticker: str) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT 1
+                   FROM trade_outcomes t
+                   JOIN orders o ON o.id = t.order_id
+                   WHERE o.dry_run = 0
+                     AND o.ok = 1
+                     AND o.action = 'buy'
+                     AND t.entry_price_cents IS NOT NULL
+                     AND t.realized_pnl_dollars IS NULL
+                     AND t.ticker = ?
+                   LIMIT 1""",
+                (ticker,),
+            ).fetchone()
+        return row is not None
+
+    def risk_summary(self) -> dict:
+        today = datetime.now(timezone.utc).date().isoformat()
+        with self.connect() as conn:
+            open_rows = conn.execute(
+                """SELECT t.order_id, t.ticker, t.side, t.entry_price_cents, t.count,
+                          o.submitted_at
+                   FROM trade_outcomes t
+                   JOIN orders o ON o.id = t.order_id
+                   WHERE o.dry_run = 0
+                     AND o.ok = 1
+                     AND o.action = 'buy'
+                     AND t.entry_price_cents IS NOT NULL
+                     AND t.realized_pnl_dollars IS NULL
+                   ORDER BY o.submitted_at DESC"""
+            ).fetchall()
+            daily = conn.execute(
+                """SELECT COUNT(*) AS trades,
+                          COALESCE(SUM(COALESCE(t.realized_pnl_dollars, 0)), 0) AS pnl
+                   FROM orders o
+                   LEFT JOIN trade_outcomes t ON t.order_id = o.id
+                   WHERE o.dry_run = 0
+                     AND o.ok = 1
+                     AND o.action = 'buy'
+                     AND t.entry_price_cents IS NOT NULL
+                     AND substr(o.submitted_at, 1, 10) = ?""",
+                (today,),
+            ).fetchone()
+            outcomes = conn.execute(
+                """SELECT t.realized_pnl_dollars
+                   FROM trade_outcomes t
+                   JOIN orders o ON o.id = t.order_id
+                   WHERE o.dry_run = 0
+                     AND o.ok = 1
+                     AND o.action = 'buy'
+                     AND t.realized_pnl_dollars IS NOT NULL
+                   ORDER BY o.submitted_at DESC
+                   LIMIT 100"""
+            ).fetchall()
+
+        loss_streak = 0
+        for row in outcomes:
+            if float(row["realized_pnl_dollars"]) < 0:
+                loss_streak += 1
+            else:
+                break
+
+        return {
+            "open_risk_cents": int(sum(
+                int(r["entry_price_cents"] or 0) * int(r["count"] or 0)
+                for r in open_rows
+            )),
+            "open_trades": [dict(r) for r in open_rows],
+            "trades_today": int(daily["trades"] if daily else 0),
+            "daily_realized_pnl_dollars": round(float(daily["pnl"] if daily else 0.0), 4),
+            "consecutive_losses": loss_streak,
+        }
+
     # ---------- Resolutions ----------
 
     def save_resolution(self, ticker: str, result: str, raw: dict | None = None) -> None:
