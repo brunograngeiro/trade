@@ -17,7 +17,7 @@ MONTHS = {
 
 
 def readonly_query(db_path: str, sql: str, limit: int = 300) -> dict:
-    cleaned = sql.strip()
+    cleaned = _strip_leading_comments(sql.strip())
     lowered = cleaned.lower()
     if not (lowered.startswith("select ") or lowered.startswith("with ")):
         raise ValueError("only_select_queries_are_allowed")
@@ -32,6 +32,74 @@ def readonly_query(db_path: str, sql: str, limit: int = 300) -> dict:
         return {"columns": rows[0].keys() if rows else [], "rows": [dict(r) for r in rows]}
     finally:
         conn.close()
+
+
+def analyst_context(db_path: str, question: str, root: Path) -> str:
+    stats = final_minute_probability_stats(db_path)
+    schema = """
+SQLite tables: ticks, spot_ticks, signals, strategy_decisions, orders,
+trade_outcomes, market_resolutions, market_snapshots, market_radar_candidates,
+balance_snapshots.
+Important: orders.raw stores Kalshi order JSON; trade_outcomes contains realized PnL.
+"""
+    snippets = _code_snippets(root, question)
+    return (
+        f"{schema}\n"
+        f"Final-minute BTC15M stats: {stats}\n\n"
+        f"Relevant code snippets:\n{snippets}"
+    )
+
+
+def _strip_leading_comments(sql: str) -> str:
+    lines = sql.splitlines()
+    while lines and (not lines[0].strip() or lines[0].lstrip().startswith("--")):
+        lines.pop(0)
+    return "\n".join(lines).strip()
+
+
+def _code_snippets(root: Path, question: str) -> str:
+    words = {
+        w.lower()
+        for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", question)
+        if w.lower() not in {"como", "para", "essa", "esse", "dados", "codigo", "funcoes"}
+    }
+    if not words:
+        words = {"decision", "risk", "analytics", "outcome", "order"}
+    allowed = [root / "app", root / "backtest", root / "dashboard", root / "tests"]
+    matches: list[tuple[int, Path, str]] = []
+    for base in allowed:
+        if not base.exists():
+            continue
+        for path in base.rglob("*.py"):
+            if "__pycache__" in path.parts:
+                continue
+            text = path.read_text(errors="ignore")
+            score = sum(text.lower().count(w) for w in words)
+            if score:
+                matches.append((score, path, text))
+    out = []
+    for _score, path, text in sorted(matches, reverse=True)[:5]:
+        picked = _best_snippet(text, words)
+        out.append(f"\n# {path.relative_to(root)}\n" + "\n".join(picked[:80]))
+    return "\n".join(out)[:6000]
+
+
+def _best_snippet(text: str, words: set[str]) -> list[str]:
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        stripped = line.strip().lower()
+        if (
+            (stripped.startswith("class ") or stripped.startswith("def ") or stripped.startswith("async def "))
+            and any(w in stripped for w in words)
+        ):
+            end = min(len(lines), i + 90)
+            return [f"{n+1}: {lines[n]}" for n in range(i, end)]
+    for i, line in enumerate(lines):
+        if any(w in line.lower() for w in words):
+            start = max(0, i - 8)
+            end = min(len(lines), i + 28)
+            return [f"{n+1}: {lines[n]}" for n in range(start, end)]
+    return []
 
 
 def final_minute_probability_stats(db_path: str) -> dict:

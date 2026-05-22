@@ -6,6 +6,8 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,8 +21,9 @@ from app.api.schemas import (
 )
 from app.api.state import AppState
 from app.application.collector import Collector
-from app.application.analytics import final_minute_probability_stats, readonly_query
+from app.application.analytics import analyst_context, final_minute_probability_stats, readonly_query
 from app.application.decision import StrategyDecision
+from app.application.llm import LLMClient, LLMError
 from app.application.market_scanner import MarketScanner
 from app.application.order_gateway import OrderGateway
 from app.application.risk import RiskManager
@@ -332,6 +335,53 @@ async def analytics_query(body: dict) -> dict:
         return readonly_query(_state(app).settings.db_path, sql, limit=max(1, min(limit, 1000)))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/analytics/ask")
+async def analytics_ask(body: dict) -> dict:
+    question = str(body.get("question") or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question_required")
+    provider = str(body.get("provider") or "openai").lower()
+    conversation_id = str(body.get("conversation_id") or uuid4())
+    s = _state(app)
+    s.db.save_analyst_message(conversation_id, "user", question, provider=provider)
+    recent = s.db.analyst_messages(conversation_id, limit=10)
+    context = analyst_context(s.settings.db_path, question, Path(__file__).resolve().parents[2])
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Voce e um analista quantitativo do projeto trade2. "
+                "Responda em portugues, use somente o contexto fornecido, "
+                "deixe claro quando algo for inferencia. Voce pode analisar codigo "
+                "e dados, mas nao pode executar ordens nem alterar arquivos."
+            ),
+        },
+        {"role": "system", "content": context},
+    ]
+    for msg in recent[-6:]:
+        if msg["role"] in {"user", "assistant"}:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+    try:
+        answer = await LLMClient(s.settings).chat(provider, messages)
+    except LLMError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    content = answer["content"]
+    s.db.save_analyst_message(conversation_id, "assistant", content, provider=provider,
+                              metadata=answer.get("model"))
+    return {"conversation_id": conversation_id, "provider": provider,
+            "model": answer.get("model"), "answer": content}
+
+
+@app.get("/analytics/conversations")
+async def analytics_conversations(limit: int = 20) -> dict:
+    return {"conversations": _state(app).db.recent_analyst_conversations(limit=limit)}
+
+
+@app.get("/analytics/messages")
+async def analytics_messages(conversation_id: str, limit: int = 50) -> dict:
+    return {"messages": _state(app).db.analyst_messages(conversation_id, limit=limit)}
 
 
 @app.get("/orders/recent")

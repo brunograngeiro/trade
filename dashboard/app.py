@@ -461,7 +461,50 @@ with tabs[2]:
 
 with tabs[3]:
     st.subheader("Analyst")
-    st.caption("Consultas estatísticas read-only. A integração com LLM deve gerar SQL apenas dentro deste limite.")
+    st.caption("Perguntas com LLM + consultas SQL read-only. As conversas ficam salvas no SQLite.")
+
+    provider = st.selectbox("Provider", ["openai", "deepseek", "xai"], index=0)
+    if "analyst_conversation_id" not in st.session_state:
+        st.session_state["analyst_conversation_id"] = ""
+    question = st.text_area(
+        "Pergunta",
+        placeholder="Ex: Analise a função RiskManager. O que pode bloquear entradas reais?",
+        height=90,
+    )
+    if st.button("Perguntar à IA", key="ask_llm") and question.strip():
+        try:
+            payload = {
+                "provider": provider,
+                "question": question,
+                "conversation_id": st.session_state["analyst_conversation_id"] or None,
+            }
+            r = requests.post(f"{API_URL}/analytics/ask", json=payload, timeout=60)
+            if r.status_code >= 400:
+                st.error(r.text)
+            else:
+                answer = r.json()
+                st.session_state["analyst_conversation_id"] = answer["conversation_id"]
+                st.markdown(answer["answer"])
+                st.caption(f"{answer.get('provider')} / {answer.get('model')} / {answer['conversation_id']}")
+        except Exception as exc:  # noqa: BLE001
+            st.error(str(exc))
+
+    with st.expander("Histórico da conversa"):
+        conv_id = st.session_state.get("analyst_conversation_id")
+        if conv_id:
+            hist = _get(f"/analytics/messages?conversation_id={conv_id}&limit=20").get("messages", [])
+            for msg in hist:
+                st.markdown(f"**{msg['role']}**: {msg['content']}")
+        else:
+            st.caption("Sem conversa ativa.")
+
+    with st.expander("Conversas recentes"):
+        convs = _get("/analytics/conversations?limit=20").get("conversations", [])
+        if convs:
+            cdf = pd.DataFrame(convs)
+            st.dataframe(cdf, use_container_width=True, hide_index=True)
+
+    st.divider()
     if st.button("Probabilidades no minuto final", key="final_minute_stats"):
         stats = _get("/analytics/final-minute", timeout=20)
         st.metric("Mercados analisados", stats.get("markets", 0))
@@ -480,6 +523,7 @@ with tabs[3]:
             )
 
     st.divider()
+    st.caption("A caixa abaixo aceita SQL, não linguagem natural. Use SELECT ou WITH; escrita é bloqueada.")
     default_sql = """SELECT ticker, submitted_at, side, limit_price_cents
 FROM orders
 WHERE dry_run = 0

@@ -50,6 +50,11 @@ class Settings(BaseSettings):
     risk_max_daily_trades: int = Field(default=10, alias="RISK_MAX_DAILY_TRADES")
     risk_max_daily_loss_dollars: float = Field(default=6.0, alias="RISK_MAX_DAILY_LOSS_DOLLARS")
     risk_max_consecutive_losses: int = Field(default=3, alias="RISK_MAX_CONSECUTIVE_LOSSES")
+    openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
+    xai_api_key: str = Field(default="", alias="XAI_API_KEY")
+    deepseek_api_key: str = Field(default="", alias="DEEPSEEK_API_KEY")
+    anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
+    gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
 
     prob_explosion_delta: float = Field(default=0.20, alias="PROB_EXPLOSION_DELTA")
     prob_plateau_threshold: float = Field(default=0.99, alias="PROB_PLATEAU_THRESHOLD")

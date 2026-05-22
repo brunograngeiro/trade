@@ -174,6 +174,18 @@ CREATE INDEX IF NOT EXISTS idx_market_radar_scan_rank
     ON market_radar_candidates(scan_id, rank);
 CREATE INDEX IF NOT EXISTS idx_market_radar_ticker_time
     ON market_radar_candidates(ticker, captured_at);
+
+CREATE TABLE IF NOT EXISTS analyst_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    role TEXT NOT NULL,
+    provider TEXT,
+    content TEXT NOT NULL,
+    metadata TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_analyst_messages_conversation
+    ON analyst_messages(conversation_id, created_at);
 """
 
 
@@ -404,6 +416,43 @@ class Database:
             rows = conn.execute(
                 """SELECT * FROM market_radar_candidates
                    ORDER BY captured_at DESC, rank ASC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---------- Analyst ----------
+
+    def save_analyst_message(self, conversation_id: str, role: str, content: str,
+                             provider: str | None = None,
+                             metadata: str | None = None) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO analyst_messages
+                   (conversation_id, created_at, role, provider, content, metadata)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (conversation_id, datetime.now(timezone.utc).isoformat(), role,
+                 provider, content, metadata),
+            )
+
+    def analyst_messages(self, conversation_id: str, limit: int = 50) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM analyst_messages
+                   WHERE conversation_id = ?
+                   ORDER BY created_at DESC LIMIT ?""",
+                (conversation_id, limit),
+            ).fetchall()
+        return [dict(r) for r in rows][::-1]
+
+    def recent_analyst_conversations(self, limit: int = 20) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT conversation_id, MAX(created_at) AS updated_at,
+                          COUNT(*) AS messages,
+                          substr(MAX(CASE WHEN role = 'user' THEN content END), 1, 120) AS title
+                   FROM analyst_messages
+                   GROUP BY conversation_id
+                   ORDER BY updated_at DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
         return [dict(r) for r in rows]
