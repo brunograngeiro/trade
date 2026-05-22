@@ -21,7 +21,13 @@ from app.api.schemas import (
 )
 from app.api.state import AppState
 from app.application.collector import Collector
-from app.application.analytics import analyst_context, final_minute_probability_stats, readonly_query
+from app.application.analytics import (
+    analyst_context,
+    compact_rows,
+    final_minute_probability_stats,
+    readonly_query,
+    schema_summary,
+)
 from app.application.decision import StrategyDecision
 from app.application.llm import LLMClient, LLMError
 from app.application.market_scanner import MarketScanner
@@ -372,6 +378,86 @@ async def analytics_ask(body: dict) -> dict:
                               metadata=answer.get("model"))
     return {"conversation_id": conversation_id, "provider": provider,
             "model": answer.get("model"), "answer": content}
+
+
+@app.post("/analytics/data-chat")
+async def analytics_data_chat(body: dict) -> dict:
+    question = str(body.get("question") or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question_required")
+    provider = str(body.get("provider") or "openai").lower()
+    conversation_id = str(body.get("conversation_id") or uuid4())
+    s = _state(app)
+    s.db.save_analyst_message(conversation_id, "user", question, provider=f"data:{provider}")
+
+    schema = schema_summary(s.settings.db_path)
+    recent = s.db.analyst_messages(conversation_id, limit=8)
+    history = "\n".join(
+        f"{m['role']}: {m['content'][:800]}" for m in recent[-6:]
+        if m["role"] in {"user", "assistant"}
+    )
+    sql_messages = [
+        {
+            "role": "system",
+            "content": (
+                "Voce gera SQL SQLite read-only para analisar o banco trade2. "
+                "Responda SOMENTE com um SELECT ou WITH, sem markdown, sem comentarios, "
+                "sem ponto e virgula. Nao use INSERT/UPDATE/DELETE/PRAGMA. "
+                "Para trades reais por data, use orders.submitted_at e faca join com trade_outcomes. "
+                "Prefira agregacoes curtas quando a pergunta pedir resumo."
+            ),
+        },
+        {"role": "system", "content": f"Schema:\n{schema}\n\nHistorico recente:\n{history}"},
+        {"role": "user", "content": question},
+    ]
+    try:
+        sql_answer = await LLMClient(s.settings).chat(provider, sql_messages, max_tokens=500)
+        sql = _extract_sql(sql_answer["content"])
+        result = readonly_query(s.settings.db_path, sql, limit=300)
+    except (LLMError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    summary_messages = [
+        {
+            "role": "system",
+            "content": (
+                "Voce e um analista de dados do projeto trade2. Responda em portugues, "
+                "de forma curta e objetiva. Use somente o resultado da consulta. "
+                "Se houver muitas linhas, resuma os principais totais e mencione que a tabela tem detalhes."
+            ),
+        },
+        {"role": "user", "content": (
+            f"Pergunta: {question}\nSQL executado:\n{sql}\n"
+            f"Colunas: {result.get('columns')}\nLinhas: {compact_rows(result.get('rows', []))}"
+        )},
+    ]
+    try:
+        summary = await LLMClient(s.settings).chat(provider, summary_messages, max_tokens=700)
+    except LLMError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    content = summary["content"]
+    metadata = f"{summary.get('model')} | sql={sql}"
+    s.db.save_analyst_message(conversation_id, "assistant", content,
+                              provider=f"data:{provider}", metadata=metadata)
+    return {
+        "conversation_id": conversation_id,
+        "provider": provider,
+        "model": summary.get("model"),
+        "answer": content,
+        "sql": sql,
+        "rows": result.get("rows", []),
+        "columns": result.get("columns", []),
+    }
+
+
+def _extract_sql(text: str) -> str:
+    cleaned = text.strip()
+    if "```" in cleaned:
+        parts = cleaned.split("```")
+        cleaned = parts[1] if len(parts) > 1 else cleaned
+        cleaned = cleaned.removeprefix("sql").strip()
+    return cleaned.strip().rstrip(";")
 
 
 @app.get("/analytics/conversations")

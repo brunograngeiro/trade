@@ -7,6 +7,7 @@ import sqlite3
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 
 TICKER_RE = re.compile(r"KXBTC15M-(\d{2})([A-Z]{3})(\d{2})(\d{2})(\d{2})")
@@ -32,6 +33,40 @@ def readonly_query(db_path: str, sql: str, limit: int = 300) -> dict:
         return {"columns": rows[0].keys() if rows else [], "rows": [dict(r) for r in rows]}
     finally:
         conn.close()
+
+
+def schema_summary(db_path: str) -> str:
+    conn = sqlite3.connect(db_path)
+    try:
+        tables = [
+            r[0] for r in conn.execute(
+                """SELECT name FROM sqlite_master
+                   WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                   ORDER BY name"""
+            )
+        ]
+        chunks = []
+        for table in tables:
+            cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            col_text = ", ".join(f"{c[1]} {c[2]}" for c in cols)
+            chunks.append(f"{table}: {col_text}")
+        hints = """
+Domain hints:
+- Real trades are buy rows in orders where dry_run = 0 and ok = 1.
+- Use orders.submitted_at for trade date/time filters.
+- Join trade_outcomes t ON t.order_id = orders.id for PnL/resolution.
+- Do not use trade_outcomes.updated_at as the trade date; it is reconciliation time.
+- For today's UTC trades, use substr(orders.submitted_at, 1, 10) = date('now').
+- Prefer aggregate summaries unless the user asks for each row.
+"""
+        return "\n".join(chunks) + "\n" + hints
+    finally:
+        conn.close()
+
+
+def compact_rows(rows: list[dict[str, Any]], max_rows: int = 30) -> str:
+    shown = rows[:max_rows]
+    return str(shown)
 
 
 def analyst_context(db_path: str, question: str, root: Path) -> str:

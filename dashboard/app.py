@@ -461,42 +461,78 @@ with tabs[2]:
 
 with tabs[3]:
     st.subheader("Analyst")
-    st.caption("Perguntas com LLM + consultas SQL read-only. As conversas ficam salvas no SQLite.")
+    st.caption("Chats salvos no SQLite. Código analisa funções; Dados gera SQL read-only e resume.")
 
-    provider = st.selectbox("Provider", ["openai", "deepseek", "xai"], index=0)
-    if "analyst_conversation_id" not in st.session_state:
-        st.session_state["analyst_conversation_id"] = ""
-    question = st.text_area(
-        "Pergunta",
-        placeholder="Ex: Analise a função RiskManager. O que pode bloquear entradas reais?",
-        height=90,
-    )
-    if st.button("Perguntar à IA", key="ask_llm") and question.strip():
-        try:
+    provider = st.selectbox("Provider", ["openai", "deepseek", "xai"], index=0, key="analyst_provider")
+    chat_code, chat_data = st.tabs(["Código", "Dados"])
+
+    with chat_code:
+        if "analyst_conversation_id" not in st.session_state:
+            st.session_state["analyst_conversation_id"] = ""
+        if st.button("Nova conversa", key="new_code_chat"):
+            st.session_state["analyst_conversation_id"] = ""
+            st.rerun()
+        conv_id = st.session_state["analyst_conversation_id"]
+        hist = _get(f"/analytics/messages?conversation_id={conv_id}&limit=30").get("messages", []) if conv_id else []
+        for msg in hist:
+            with st.chat_message("assistant" if msg["role"] == "assistant" else "user"):
+                st.markdown(msg["content"])
+        question = st.chat_input("Pergunte sobre o código, estratégia ou dados...", key="code_chat_input")
+        if question:
+            with st.chat_message("user"):
+                st.markdown(question)
             payload = {
                 "provider": provider,
                 "question": question,
                 "conversation_id": st.session_state["analyst_conversation_id"] or None,
             }
-            r = requests.post(f"{API_URL}/analytics/ask", json=payload, timeout=60)
+            with st.spinner("Analisando..."):
+                r = requests.post(f"{API_URL}/analytics/ask", json=payload, timeout=70)
             if r.status_code >= 400:
                 st.error(r.text)
             else:
                 answer = r.json()
                 st.session_state["analyst_conversation_id"] = answer["conversation_id"]
-                st.markdown(answer["answer"])
-                st.caption(f"{answer.get('provider')} / {answer.get('model')} / {answer['conversation_id']}")
-        except Exception as exc:  # noqa: BLE001
-            st.error(str(exc))
+                with st.chat_message("assistant"):
+                    st.markdown(answer["answer"])
+                st.rerun()
 
-    with st.expander("Histórico da conversa"):
-        conv_id = st.session_state.get("analyst_conversation_id")
-        if conv_id:
-            hist = _get(f"/analytics/messages?conversation_id={conv_id}&limit=20").get("messages", [])
-            for msg in hist:
-                st.markdown(f"**{msg['role']}**: {msg['content']}")
-        else:
-            st.caption("Sem conversa ativa.")
+    with chat_data:
+        if "data_conversation_id" not in st.session_state:
+            st.session_state["data_conversation_id"] = ""
+        if st.button("Nova conversa", key="new_data_chat"):
+            st.session_state["data_conversation_id"] = ""
+            st.rerun()
+        conv_id = st.session_state["data_conversation_id"]
+        hist = _get(f"/analytics/messages?conversation_id={conv_id}&limit=30").get("messages", []) if conv_id else []
+        for msg in hist:
+            with st.chat_message("assistant" if msg["role"] == "assistant" else "user"):
+                st.markdown(msg["content"])
+                if msg["role"] == "assistant" and msg.get("metadata"):
+                    st.caption(msg["metadata"])
+        data_question = st.chat_input("Pergunte aos dados: ex. como foram os trades reais hoje?", key="data_chat_input")
+        if data_question:
+            with st.chat_message("user"):
+                st.markdown(data_question)
+            payload = {
+                "provider": provider,
+                "question": data_question,
+                "conversation_id": st.session_state["data_conversation_id"] or None,
+            }
+            with st.spinner("Consultando dados..."):
+                r = requests.post(f"{API_URL}/analytics/data-chat", json=payload, timeout=90)
+            if r.status_code >= 400:
+                st.error(r.text)
+            else:
+                answer = r.json()
+                st.session_state["data_conversation_id"] = answer["conversation_id"]
+                with st.chat_message("assistant"):
+                    st.markdown(answer["answer"])
+                    with st.expander("SQL e resultado"):
+                        st.code(answer["sql"], language="sql")
+                        st.dataframe(pd.DataFrame(answer.get("rows", [])),
+                                     use_container_width=True, hide_index=True)
+                st.rerun()
 
     with st.expander("Conversas recentes"):
         convs = _get("/analytics/conversations?limit=20").get("conversations", [])
