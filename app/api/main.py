@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -458,6 +459,109 @@ def _extract_sql(text: str) -> str:
         cleaned = parts[1] if len(parts) > 1 else cleaned
         cleaned = cleaned.removeprefix("sql").strip()
     return cleaned.strip().rstrip(";")
+
+
+@app.post("/analytics/chat")
+async def analytics_chat(body: dict) -> dict:
+    question = str(body.get("question") or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question_required")
+    provider = str(body.get("provider") or "openai").lower()
+    conversation_id = str(body.get("conversation_id") or uuid4())
+    s = _state(app)
+    s.db.save_analyst_message(conversation_id, "user", question, provider=provider)
+
+    root = Path(__file__).resolve().parents[2]
+    schema = schema_summary(s.settings.db_path)
+    code_context = analyst_context(s.settings.db_path, question, root)
+    recent = s.db.analyst_messages(conversation_id, limit=10)
+    history = "\n".join(
+        f"{m['role']}: {m['content'][:900]}" for m in recent[-6:]
+        if m["role"] in {"user", "assistant"}
+    )
+    router_messages = [
+        {
+            "role": "system",
+            "content": (
+                "Classifique a pergunta do usuario para o projeto trade2. "
+                "Se precisar consultar dados tabulares atuais, responda JSON "
+                "{\"mode\":\"sql\",\"sql\":\"SELECT ...\"}. "
+                "Se for pergunta sobre codigo, estrategia, explicacao ou opiniao, responda JSON "
+                "{\"mode\":\"answer\",\"answer\":\"...\"}. "
+                "Para SQL use apenas SQLite SELECT/WITH, sem markdown e sem ponto e virgula. "
+                "Para trades por data use orders.submitted_at e join com trade_outcomes."
+            ),
+        },
+        {"role": "system", "content": f"Schema:\n{schema}\n\nContexto de codigo:\n{code_context}\n\nHistorico:\n{history}"},
+        {"role": "user", "content": question},
+    ]
+    try:
+        routed = await LLMClient(s.settings).chat(provider, router_messages, max_tokens=900)
+        decision = _parse_chat_decision(routed["content"])
+    except LLMError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    mode = decision.get("mode")
+    sql = decision.get("sql")
+    rows = []
+    columns = []
+    metadata = routed.get("model")
+    if mode == "sql" and sql:
+        try:
+            result = readonly_query(s.settings.db_path, sql, limit=300)
+            rows = result.get("rows", [])
+            columns = result.get("columns", [])
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        summary_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Voce e um analista do projeto trade2. Responda em portugues como chat, "
+                    "curto e direto. Use somente o resultado da consulta e mencione inferencias."
+                ),
+            },
+            {"role": "user", "content": (
+                f"Pergunta: {question}\nSQL:\n{sql}\nColunas: {columns}\nLinhas: {compact_rows(rows)}"
+            )},
+        ]
+        try:
+            summary = await LLMClient(s.settings).chat(provider, summary_messages, max_tokens=800)
+        except LLMError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        answer = summary["content"]
+        metadata = f"{summary.get('model')} | sql={sql}"
+    else:
+        answer = decision.get("answer") or routed["content"]
+
+    s.db.save_analyst_message(conversation_id, "assistant", answer,
+                              provider=provider, metadata=metadata)
+    return {
+        "conversation_id": conversation_id,
+        "provider": provider,
+        "model": metadata,
+        "answer": answer,
+        "sql": sql,
+        "rows": rows,
+        "columns": columns,
+    }
+
+
+def _parse_chat_decision(content: str) -> dict:
+    text = content.strip()
+    if "```" in text:
+        parts = text.split("```")
+        text = parts[1] if len(parts) > 1 else text
+        text = text.removeprefix("json").strip()
+    if "{" in text and "}" in text:
+        text = text[text.find("{"):text.rfind("}") + 1]
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    return {"mode": "answer", "answer": content}
 
 
 @app.get("/analytics/conversations")
