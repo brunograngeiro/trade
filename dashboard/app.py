@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
+import re
+import sqlite3
 import sys
-from datetime import datetime
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -36,7 +39,184 @@ def _get(path: str, timeout: float = 5.0) -> dict:
         return {"_error": str(exc)}
 
 
-tabs = st.tabs(["Live", "Portfolio", "Sinais", "Trades", "Backtest"])
+TICKER_RE = re.compile(r"KXBTC15M-(\d{2})([A-Z]{3})(\d{2})(\d{2})(\d{2})")
+MONTHS = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+TTC_BUCKETS = [
+    ("0-30s", 0, 30),
+    ("30-60s", 30, 60),
+    ("60-120s", 60, 120),
+    ("2-3m", 120, 180),
+    ("3-5m", 180, 300),
+    ("5-8m", 300, 480),
+    ("8-12m", 480, 720),
+    ("12-15m", 720, 900),
+]
+REGIME_ORDER = [
+    "40-60",
+    "60-70/30-40",
+    "70-90/10-30",
+    "90-95/5-10",
+    "95-99/1-5",
+    ">=99/<=1",
+]
+
+
+def _close_time_from_ticker(ticker: str) -> datetime | None:
+    match = TICKER_RE.match(ticker)
+    if not match:
+        return None
+    yy, mon, dd, hh, mm = match.groups()
+    et = datetime(2000 + int(yy), MONTHS[mon], int(dd), int(hh), int(mm))
+    return et + timedelta(hours=4)
+
+
+def _yes_mid(row: sqlite3.Row) -> float | None:
+    if row["yes_bid"] is not None and row["yes_ask"] is not None:
+        return (row["yes_bid"] + row["yes_ask"]) / 2
+    return row["last_price"]
+
+
+def _regime(prob: float) -> str:
+    confidence = max(prob, 1.0 - prob)
+    if 0.40 <= prob <= 0.60:
+        return "40-60"
+    if confidence < 0.70:
+        return "60-70/30-40"
+    if confidence < 0.90:
+        return "70-90/10-30"
+    if confidence < 0.95:
+        return "90-95/5-10"
+    if confidence < 0.99:
+        return "95-99/1-5"
+    return ">=99/<=1"
+
+
+@st.cache_data(ttl=120)
+def calibration_stats(db_path: str) -> dict:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    resolutions = {
+        r["ticker"]: r["result"]
+        for r in conn.execute(
+            "SELECT ticker, result FROM market_resolutions WHERE result IN ('yes', 'no')"
+        )
+    }
+
+    ttc_regime = {label: Counter() for label, _, _ in TTC_BUCKETS}
+    ttc_correct = {label: Counter() for label, _, _ in TTC_BUCKETS}
+    ttc_totals = Counter()
+    final_tick = Counter()
+    final_correct = Counter()
+    by_ticker: dict[str, list[tuple[float, float]]] = defaultdict(list)
+
+    for row in conn.execute(
+        """SELECT ticker, captured_at, yes_bid, yes_ask, last_price
+           FROM ticks ORDER BY ticker, captured_at"""
+    ):
+        ticker = row["ticker"]
+        result = resolutions.get(ticker)
+        if result not in ("yes", "no"):
+            continue
+        close_t = _close_time_from_ticker(ticker)
+        prob = _yes_mid(row)
+        if close_t is None or prob is None:
+            continue
+        captured = datetime.fromisoformat(row["captured_at"]).replace(tzinfo=None)
+        ttc = (close_t - captured).total_seconds()
+        if ttc < 0 or ttc > 900:
+            continue
+        prob = max(0.0, min(1.0, prob))
+        side = "yes" if prob >= 0.5 else "no"
+        regime = _regime(prob)
+        for label, lo, hi in TTC_BUCKETS:
+            if lo <= ttc < hi:
+                ttc_regime[label][regime] += 1
+                ttc_totals[label] += 1
+                if side == result:
+                    ttc_correct[label][regime] += 1
+                break
+        by_ticker[ticker].append((ttc, prob))
+
+    cross_rows = []
+    for window in (30, 60, 120, 180, 300, 900):
+        markets = with_cross = last_ok = after_cross_ok = after_cross_n = 0
+        for ticker, samples in by_ticker.items():
+            result = resolutions[ticker]
+            sub = [(ttc, prob) for ttc, prob in samples if ttc <= window]
+            if len(sub) < 2:
+                continue
+            markets += 1
+            prev_side = None
+            crosses = 0
+            last_side = None
+            for _ttc, prob in sub:
+                side = "yes" if prob > 0.5 else "no" if prob < 0.5 else None
+                if side is None:
+                    continue
+                if prev_side and side != prev_side:
+                    crosses += 1
+                prev_side = side
+                last_side = side
+            if last_side == result:
+                last_ok += 1
+            if crosses:
+                with_cross += 1
+                after_cross_n += 1
+                if last_side == result:
+                    after_cross_ok += 1
+        cross_rows.append({
+            "janela": f"{window}s" if window < 900 else "15m",
+            "mercados": markets,
+            "cruzaram_50": with_cross,
+            "pct_cruzaram": with_cross / markets if markets else 0,
+            "ultimo_lado_acerto": last_ok / markets if markets else 0,
+            "pos_cruzamento_acerto": after_cross_ok / after_cross_n if after_cross_n else None,
+        })
+
+    for ticker, samples in by_ticker.items():
+        if not samples:
+            continue
+        _ttc, prob = samples[-1]
+        regime = _regime(prob)
+        side = "yes" if prob >= 0.5 else "no"
+        final_tick[regime] += 1
+        if side == resolutions[ticker]:
+            final_correct[regime] += 1
+
+    conn.close()
+    dist_rows = []
+    for label, _, _ in TTC_BUCKETS:
+        total = ttc_totals[label]
+        for regime in REGIME_ORDER:
+            n = ttc_regime[label][regime]
+            dist_rows.append({
+                "ttc": label,
+                "regime": regime,
+                "ticks": n,
+                "pct_ticks": n / total if total else 0,
+                "direction_accuracy": ttc_correct[label][regime] / n if n else None,
+            })
+    final_rows = [
+        {
+            "regime": regime,
+            "markets": final_tick[regime],
+            "accuracy": final_correct[regime] / final_tick[regime]
+            if final_tick[regime] else None,
+        }
+        for regime in REGIME_ORDER
+    ]
+    return {
+        "dist": dist_rows,
+        "cross": cross_rows,
+        "final": final_rows,
+        "markets": len(by_ticker),
+    }
+
+
+tabs = st.tabs(["Live", "Portfolio", "Radar", "Sinais", "Trades", "Backtest"])
 
 
 # -------------------- Live --------------------
@@ -68,38 +248,80 @@ with tabs[0]:
         st.caption(f"Captured at: {live.get('captured_at')}")
         st.caption(live.get("title") or "")
 
-        ticks = _get(f"/ticks/{live['ticker']}").get("ticks", [])
-        spot = _get("/spot/recent?limit=500").get("spot", [])
+        stats = calibration_stats(SETTINGS.db_path)
+        dist = pd.DataFrame(stats["dist"])
+        cross = pd.DataFrame(stats["cross"])
+        final = pd.DataFrame(stats["final"])
 
-        if ticks:
-            df = pd.DataFrame(ticks)
-            df["captured_at"] = pd.to_datetime(df["captured_at"])
-            df["yes_mid"] = (df["yes_bid"].fillna(0) + df["yes_ask"].fillna(0)) / 2
+        st.subheader("Calibração por tempo até o fechamento")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Mercados calibrados", stats["markets"])
+        c2.metric("Cruzam 50% nos 60s finais",
+                  f"{cross.loc[cross['janela'] == '60s', 'pct_cruzaram'].iloc[0] * 100:.1f}%")
+        c3.metric("Último lado acerta",
+                  f"{cross.loc[cross['janela'] == '60s', 'ultimo_lado_acerto'].iloc[0] * 100:.1f}%")
 
-            fig = go.Figure()
-            # Left axis: Kalshi yes_mid (0-1)
-            fig.add_trace(go.Scatter(
-                x=df["captured_at"], y=df["yes_mid"], name="Kalshi YES mid",
-                line=dict(color="#19c37d"), yaxis="y1",
+        fig_dist = go.Figure()
+        for regime in REGIME_ORDER:
+            chunk = dist[dist["regime"] == regime]
+            fig_dist.add_trace(go.Bar(
+                x=chunk["ttc"], y=chunk["pct_ticks"] * 100,
+                name=regime,
+                customdata=(chunk["direction_accuracy"] * 100).round(1),
+                hovertemplate="%{x}<br>%{fullData.name}: %{y:.1f}% dos ticks"
+                              "<br>acerto direção: %{customdata:.1f}%<extra></extra>",
             ))
-            # Right axis: Coinbase spot price
-            if spot:
-                sdf = pd.DataFrame(spot)
-                sdf["captured_at"] = pd.to_datetime(sdf["captured_at"])
-                fig.add_trace(go.Scatter(
-                    x=sdf["captured_at"], y=sdf["price"], name="Coinbase BTC-USD",
-                    line=dict(color="#f59e0b", dash="dot"), yaxis="y2",
-                ))
-            fig.add_hline(y=SETTINGS.prob_plateau_threshold, line_dash="dash",
-                          annotation_text=f"plateau≥{SETTINGS.prob_plateau_threshold:.2f}")
-            fig.update_layout(
-                height=440, margin=dict(t=20, b=10, l=10, r=10),
-                yaxis=dict(title="YES prob", range=[0, 1], side="left"),
-                yaxis2=dict(title="BTC-USD", overlaying="y", side="right",
-                            showgrid=False),
-                legend=dict(orientation="h", y=-0.15),
+        fig_dist.update_layout(
+            barmode="stack", height=360, margin=dict(t=10, b=10, l=10, r=10),
+            yaxis_title="% dos ticks", legend=dict(orientation="h", y=-0.18),
+        )
+        st.plotly_chart(fig_dist, use_container_width=True)
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            fig_cross = go.Figure()
+            fig_cross.add_trace(go.Bar(
+                x=cross["janela"], y=cross["pct_cruzaram"] * 100,
+                name="cruzaram 50%", marker_color="#f59e0b",
+            ))
+            fig_cross.add_trace(go.Scatter(
+                x=cross["janela"], y=cross["pos_cruzamento_acerto"] * 100,
+                name="acerto após cruzar", mode="lines+markers",
+                line=dict(color="#19c37d"),
+            ))
+            fig_cross.update_layout(
+                height=320, margin=dict(t=10, b=10, l=10, r=10),
+                yaxis_title="%", legend=dict(orientation="h", y=-0.18),
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig_cross, use_container_width=True)
+
+        with col_b:
+            fig_final = go.Figure()
+            fig_final.add_trace(go.Bar(
+                x=final["regime"], y=final["markets"],
+                name="mercados", marker_color="#64748b", yaxis="y1",
+            ))
+            fig_final.add_trace(go.Scatter(
+                x=final["regime"], y=final["accuracy"] * 100,
+                name="acerto", mode="lines+markers",
+                line=dict(color="#19c37d"), yaxis="y2",
+            ))
+            fig_final.update_layout(
+                height=320, margin=dict(t=10, b=10, l=10, r=10),
+                yaxis=dict(title="mercados"),
+                yaxis2=dict(title="acerto %", overlaying="y", side="right", range=[0, 105]),
+                legend=dict(orientation="h", y=-0.18),
+            )
+            st.plotly_chart(fig_final, use_container_width=True)
+
+        decisions = _get("/strategy/decisions/recent?limit=20").get("decisions", [])
+        if decisions:
+            st.subheader("Últimas decisões da estratégia")
+            ddf = pd.DataFrame(decisions)
+            ddf["captured_at"] = pd.to_datetime(ddf["captured_at"])
+            keep = ["captured_at", "ticker", "action", "side", "probability",
+                    "confidence", "ttc_seconds", "limit_price_cents", "reason"]
+            st.dataframe(ddf[keep], use_container_width=True, hide_index=True)
     else:
         st.info("Aguardando primeiro tick do coletor...")
 
@@ -193,9 +415,82 @@ with tabs[1]:
             st.caption("Nenhum trade real registrado ainda.")
 
 
-# -------------------- Sinais --------------------
+# -------------------- Radar --------------------
 
 with tabs[2]:
+    st.subheader("Radar semi-automático")
+    st.caption("Snapshot diário de mercados com volume/liquidez, spread aceitável e deadline próximo. Observação apenas.")
+    if st.button("Refresh", key="refresh_radar"):
+        st.rerun()
+
+    radar = _get("/markets/radar/recent?limit=200").get("candidates", [])
+    if radar:
+        rdf = pd.DataFrame(radar)
+        rdf["captured_at"] = pd.to_datetime(rdf["captured_at"])
+        rdf["close_time"] = pd.to_datetime(rdf["close_time"], errors="coerce")
+        rdf["ttc_h"] = rdf["ttc_seconds"] / 3600
+        rdf["yes_mid_pct"] = rdf["yes_mid"] * 100
+        latest_scan = rdf["scan_id"].iloc[0]
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Scan", latest_scan)
+        c2.metric("Candidatos salvos", len(rdf))
+        c3.metric("Fecha <=24h", int((rdf["ttc_h"] <= 24).sum()))
+        c4.metric("Spread mediano", f"{rdf['spread_cents'].median():.1f}c")
+
+        category = st.multiselect(
+            "Categoria",
+            sorted([x for x in rdf["category"].dropna().unique().tolist() if x]),
+            default=[],
+        )
+        view = rdf.copy()
+        if category:
+            view = view[view["category"].isin(category)]
+
+        cols = [
+            "rank", "score", "ticker", "title", "category", "ttc_h",
+            "yes_mid_pct", "spread_cents", "volume", "liquidity", "close_time",
+        ]
+        st.dataframe(
+            view[cols],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "score": st.column_config.NumberColumn("score", format="%.1f"),
+                "ttc_h": st.column_config.NumberColumn("TTC h", format="%.1f"),
+                "yes_mid_pct": st.column_config.NumberColumn("YES %", format="%.1f"),
+                "spread_cents": st.column_config.NumberColumn("spread c", format="%.1f"),
+            },
+        )
+
+        with st.expander("Histórico salvo"):
+            hist = _get("/markets/radar/history?limit=1000").get("candidates", [])
+            if hist:
+                hdf = pd.DataFrame(hist)
+                hdf["captured_at"] = pd.to_datetime(hdf["captured_at"])
+                hdf["close_time"] = pd.to_datetime(hdf["close_time"], errors="coerce")
+                hdf["ttc_h"] = hdf["ttc_seconds"] / 3600
+                hdf["yes_mid_pct"] = hdf["yes_mid"] * 100
+                hcols = ["captured_at", "scan_id", "rank", "score", "ticker",
+                         "yes_mid_pct", "spread_cents", "volume", "ttc_h", "title"]
+                st.dataframe(
+                    hdf[hcols],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "score": st.column_config.NumberColumn("score", format="%.1f"),
+                        "ttc_h": st.column_config.NumberColumn("TTC h", format="%.1f"),
+                        "yes_mid_pct": st.column_config.NumberColumn("YES %", format="%.1f"),
+                        "spread_cents": st.column_config.NumberColumn("spread c", format="%.1f"),
+                    },
+                )
+    else:
+        st.info("Ainda não há radar salvo. O job diário grava candidatos quando encontra mercados líquidos o bastante.")
+
+
+# -------------------- Sinais --------------------
+
+with tabs[3]:
     signals = _get("/signals/recent?limit=200").get("signals", [])
     if signals:
         df = pd.DataFrame(signals)
@@ -211,7 +506,7 @@ with tabs[2]:
 
 # -------------------- Trades --------------------
 
-with tabs[3]:
+with tabs[4]:
     orders = _get("/orders/recent?limit=200").get("orders", [])
     if orders:
         df = pd.DataFrame(orders)
@@ -231,7 +526,7 @@ with tabs[3]:
 
 # -------------------- Backtest --------------------
 
-with tabs[4]:
+with tabs[5]:
     st.subheader("Backtest single-run (fee-aware)")
     c1, c2, c3, c4 = st.columns(4)
     delta = c1.slider("Explosion Δ", 0.05, 0.40, SETTINGS.prob_explosion_delta, 0.01)

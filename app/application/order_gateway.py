@@ -31,7 +31,9 @@ class OrderGateway:
 
     def build(self, *, ticker: str, side: Side, count: int,
               limit_price_cents: int, action: str = "buy",
-              dry_run: bool | None = None) -> OrderRequest:
+              dry_run: bool | None = None,
+              time_in_force: str | None = None,
+              reduce_only: bool = False) -> OrderRequest:
         return OrderRequest(
             ticker=ticker,
             side=side,
@@ -40,11 +42,13 @@ class OrderGateway:
             limit_price_cents=limit_price_cents,
             client_order_id=f"trade2-{uuid.uuid4().hex[:16]}",
             dry_run=bool(dry_run) if dry_run is not None else not self.settings.enable_real_orders,
+            time_in_force=time_in_force,
+            reduce_only=reduce_only,
         )
 
     async def submit(self, request: OrderRequest) -> OrderResult:
         cost = request.limit_price_cents * request.count
-        if cost > self.settings.max_order_cost_cents:
+        if request.action == "buy" and cost > self.settings.max_order_cost_cents:
             return self._record(request, ok=False, raw={},
                                 error=f"cost_exceeds_max:{cost}>{self.settings.max_order_cost_cents}")
 
@@ -72,6 +76,10 @@ class OrderGateway:
             "count": request.count,
             "type": "limit",
         }
+        if request.time_in_force:
+            payload["time_in_force"] = request.time_in_force
+        if request.reduce_only:
+            payload["reduce_only"] = True
         if request.side == Side.YES:
             payload["yes_price"] = request.limit_price_cents
         else:

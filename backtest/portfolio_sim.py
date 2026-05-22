@@ -21,6 +21,7 @@ from typing import Iterable
 
 from app.application.signals import SignalConfig, SignalEngine
 from app.domain.entities import MarketPhase, Side, SignalKind, Tick
+from backtest.engine import close_time_from_ticker
 
 
 def kalshi_fee(price: float, count: int = 1, rate: float = 0.07) -> float:
@@ -35,6 +36,10 @@ class SimParams:
     explosion_window_seconds: int = 60
     plateau_threshold: float = 0.99
     plateau_seconds: int = 99999
+    extreme_close_prob: float = 0.99  # high default = effectively disabled
+    extreme_close_ttc_seconds: float = 60.0
+    extreme_close_persistence_seconds: float = 60.0
+    only_signal_kind: str | None = None  # restrict to one kind
     min_phase: str | None = "late"
     contrarian: bool = False  # if True, fade the signal side
 
@@ -143,6 +148,9 @@ def run_simulation(db_path: str, params: SimParams) -> SimResult:
         plateau_threshold=params.plateau_threshold,
         plateau_seconds=params.plateau_seconds,
         explosion_window_seconds=params.explosion_window_seconds,
+        extreme_close_prob=params.extreme_close_prob,
+        extreme_close_ttc_seconds=params.extreme_close_ttc_seconds,
+        extreme_close_persistence_seconds=params.extreme_close_persistence_seconds,
     ))
 
     for row in conn.execute(
@@ -152,18 +160,23 @@ def run_simulation(db_path: str, params: SimParams) -> SimResult:
         if ticker not in res_map or ticker not in market_windows:
             continue
         start, end = market_windows[ticker]
+        close_t = close_time_from_ticker(ticker)
         engine.reset()
         for r in conn.execute(
             "SELECT * FROM ticks WHERE ticker=? ORDER BY captured_at ASC", (ticker,)
         ):
             t = datetime.fromisoformat(r["captured_at"])
             phase = _phase_for(t, start, end)
+            ttc = ((close_t - t.replace(tzinfo=None)).total_seconds()
+                   if close_t else None)
             tick = Tick(ticker=ticker, captured_at=t,
                         yes_bid=r["yes_bid"], yes_ask=r["yes_ask"],
                         no_bid=r["no_bid"], no_ask=r["no_ask"],
                         last_price=r["last_price"], volume=r["volume"])
-            sig = engine.evaluate(tick, phase)
+            sig = engine.evaluate(tick, phase, ttc_seconds=ttc)
             if sig.kind == SignalKind.NONE:
+                continue
+            if params.only_signal_kind and sig.kind.value != params.only_signal_kind:
                 continue
             if params.min_phase and phase.value != params.min_phase:
                 continue

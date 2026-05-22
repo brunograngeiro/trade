@@ -38,10 +38,12 @@ class KalshiClient:
     # ---------- Public ----------
 
     async def get_markets(self, *, series_ticker: str | None = None, status: str = "open",
-                          limit: int = 100) -> dict:
+                          limit: int = 100, cursor: str | None = None) -> dict:
         params: dict[str, Any] = {"status": status, "limit": limit}
         if series_ticker:
             params["series_ticker"] = series_ticker
+        if cursor:
+            params["cursor"] = cursor
         return await self._public("GET", "/markets", params=params)
 
     async def get_market(self, ticker: str) -> dict:

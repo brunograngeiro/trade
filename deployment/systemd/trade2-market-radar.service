@@ -1,0 +1,12 @@
+[Unit]
+Description=trade2 — daily Kalshi market radar (one-shot)
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/trade2
+EnvironmentFile=/home/ubuntu/trade2/.env
+ExecStart=/home/ubuntu/trade2/.venv/bin/python /home/ubuntu/trade2/scripts/run_market_radar.py
+StandardOutput=append:/home/ubuntu/trade2/data/market_radar.log
+StandardError=append:/home/ubuntu/trade2/data/market_radar.log

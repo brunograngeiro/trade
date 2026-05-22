@@ -99,7 +99,8 @@ async def run_loop(settings: Settings, interval_seconds: int = 300) -> None:
                 log.exception("resolution_sync iteration failed")
 
             try:
-                reconcile_outcomes(settings.db_path)
+                fills_payload = await client.get_fills(limit=200)
+                reconcile_outcomes(settings.db_path, fills=fills_payload.get("fills") or None)
             except Exception:  # noqa: BLE001
                 log.exception("outcome reconcile failed")
 

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+from app.application.decision import StrategyDecision
 from app.domain.entities import OrderResult, Signal, Tick
 
 
@@ -95,6 +96,80 @@ CREATE TABLE IF NOT EXISTS trade_outcomes (
     updated_at TEXT NOT NULL,
     FOREIGN KEY (order_id) REFERENCES orders(id)
 );
+
+CREATE TABLE IF NOT EXISTS strategy_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    action TEXT NOT NULL,
+    side TEXT,
+    probability REAL,
+    confidence REAL,
+    ttc_seconds REAL,
+    limit_price_cents INTEGER,
+    reason TEXT NOT NULL,
+    signal_kind TEXT NOT NULL,
+    crossed_50 INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_decisions_time
+    ON strategy_decisions(captured_at);
+CREATE INDEX IF NOT EXISTS idx_strategy_decisions_ticker_time
+    ON strategy_decisions(ticker, captured_at);
+
+CREATE TABLE IF NOT EXISTS market_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at TEXT NOT NULL,
+    series_ticker TEXT NOT NULL,
+    event_ticker TEXT,
+    ticker TEXT NOT NULL,
+    title TEXT,
+    open_time TEXT,
+    close_time TEXT,
+    yes_bid REAL,
+    yes_ask REAL,
+    no_bid REAL,
+    no_ask REAL,
+    last_price REAL,
+    volume INTEGER,
+    liquidity INTEGER,
+    spot_price REAL,
+    ttc_seconds REAL,
+    source TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_market_snapshots_series_time
+    ON market_snapshots(series_ticker, captured_at);
+CREATE INDEX IF NOT EXISTS idx_market_snapshots_ticker_time
+    ON market_snapshots(ticker, captured_at);
+
+CREATE TABLE IF NOT EXISTS market_radar_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_id TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    rank INTEGER NOT NULL,
+    score REAL NOT NULL,
+    ticker TEXT NOT NULL,
+    event_ticker TEXT,
+    series_ticker TEXT,
+    title TEXT,
+    category TEXT,
+    close_time TEXT,
+    ttc_seconds REAL,
+    yes_bid REAL,
+    yes_ask REAL,
+    no_bid REAL,
+    no_ask REAL,
+    yes_mid REAL,
+    spread_cents REAL,
+    volume INTEGER,
+    liquidity INTEGER,
+    open_interest INTEGER,
+    status TEXT,
+    raw TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_market_radar_scan_rank
+    ON market_radar_candidates(scan_id, rank);
+CREATE INDEX IF NOT EXISTS idx_market_radar_ticker_time
+    ON market_radar_candidates(ticker, captured_at);
 """
 
 
@@ -168,6 +243,145 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    # ---------- Strategy decisions ----------
+
+    def save_strategy_decision(self, decision: StrategyDecision) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO strategy_decisions
+                   (ticker, captured_at, action, side, probability, confidence,
+                    ttc_seconds, limit_price_cents, reason, signal_kind, crossed_50)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    decision.ticker,
+                    decision.captured_at.isoformat(),
+                    decision.action.value,
+                    decision.side.value if decision.side else None,
+                    decision.probability,
+                    decision.confidence,
+                    decision.ttc_seconds,
+                    decision.limit_price_cents,
+                    decision.reason,
+                    decision.signal_kind,
+                    1 if decision.crossed_50 else 0,
+                ),
+            )
+
+    def recent_strategy_decisions(self, limit: int = 200) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM strategy_decisions
+                   ORDER BY captured_at DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---------- Generic market dry-run snapshots ----------
+
+    def save_market_snapshot(self, snapshot: dict) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO market_snapshots
+                   (captured_at, series_ticker, event_ticker, ticker, title,
+                    open_time, close_time, yes_bid, yes_ask, no_bid, no_ask,
+                    last_price, volume, liquidity, spot_price, ttc_seconds, source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    snapshot["captured_at"],
+                    snapshot["series_ticker"],
+                    snapshot.get("event_ticker"),
+                    snapshot["ticker"],
+                    snapshot.get("title"),
+                    snapshot.get("open_time"),
+                    snapshot.get("close_time"),
+                    snapshot.get("yes_bid"),
+                    snapshot.get("yes_ask"),
+                    snapshot.get("no_bid"),
+                    snapshot.get("no_ask"),
+                    snapshot.get("last_price"),
+                    snapshot.get("volume"),
+                    snapshot.get("liquidity"),
+                    snapshot.get("spot_price"),
+                    snapshot.get("ttc_seconds"),
+                    snapshot.get("source", "dry_run_scanner"),
+                ),
+            )
+
+    def recent_market_snapshots(self, limit: int = 200) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM market_snapshots
+                   ORDER BY captured_at DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---------- Market radar ----------
+
+    def save_market_radar_candidates(self, rows: list[dict]) -> None:
+        if not rows:
+            return
+        with self.connect() as conn:
+            conn.executemany(
+                """INSERT INTO market_radar_candidates
+                   (scan_id, captured_at, rank, score, ticker, event_ticker,
+                    series_ticker, title, category, close_time, ttc_seconds,
+                    yes_bid, yes_ask, no_bid, no_ask, yes_mid, spread_cents,
+                    volume, liquidity, open_interest, status, raw)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        r["scan_id"],
+                        r["captured_at"],
+                        r["rank"],
+                        r["score"],
+                        r["ticker"],
+                        r.get("event_ticker"),
+                        r.get("series_ticker"),
+                        r.get("title"),
+                        r.get("category"),
+                        r.get("close_time"),
+                        r.get("ttc_seconds"),
+                        r.get("yes_bid"),
+                        r.get("yes_ask"),
+                        r.get("no_bid"),
+                        r.get("no_ask"),
+                        r.get("yes_mid"),
+                        r.get("spread_cents"),
+                        r.get("volume"),
+                        r.get("liquidity"),
+                        r.get("open_interest"),
+                        r.get("status"),
+                        r.get("raw"),
+                    )
+                    for r in rows
+                ],
+            )
+
+    def recent_market_radar(self, limit: int = 200) -> list[dict]:
+        with self.connect() as conn:
+            latest = conn.execute(
+                "SELECT scan_id FROM market_radar_candidates ORDER BY captured_at DESC LIMIT 1"
+            ).fetchone()
+            if latest is None:
+                return []
+            rows = conn.execute(
+                """SELECT * FROM market_radar_candidates
+                   WHERE scan_id = ?
+                   ORDER BY rank ASC LIMIT ?""",
+                (latest["scan_id"], limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def market_radar_history(self, limit: int = 1000) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM market_radar_candidates
+                   ORDER BY captured_at DESC, rank ASC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     # ---------- Orders ----------
 
     def save_order(self, result: OrderResult) -> None:
@@ -190,6 +404,26 @@ class Database:
                 (limit,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def count_real_orders_since(self, submitted_at: str) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) AS n FROM orders
+                   WHERE dry_run = 0
+                     AND ok = 1
+                     AND action = 'buy'
+                     AND (
+                        json_extract(raw, '$.order.status') IN ('executed', 'filled')
+                        OR CAST(COALESCE(json_extract(raw, '$.order.fill_count_fp'), '0') AS REAL) > 0
+                        OR id IN (
+                            SELECT order_id FROM trade_outcomes
+                            WHERE entry_price_cents IS NOT NULL
+                        )
+                     )
+                     AND submitted_at >= ?""",
+                (submitted_at,),
+            ).fetchone()
+        return int(row["n"] if row else 0)
 
     # ---------- Resolutions ----------
 
@@ -282,7 +516,7 @@ class Database:
                           t.resolution, t.realized_pnl_dollars, t.fees_paid_dollars
                    FROM orders o
                    LEFT JOIN trade_outcomes t ON t.order_id = o.id
-                   WHERE o.dry_run = 0 AND o.ok = 1
+                   WHERE o.dry_run = 0 AND o.ok = 1 AND o.action = 'buy'
                    ORDER BY o.submitted_at DESC LIMIT ?""",
                 (limit,),
             ).fetchall()

@@ -29,6 +29,8 @@ class RetentionPolicy:
     ticks_days: int = 14
     spot_ticks_days: int = 14
     signals_days: int = 7
+    market_snapshots_days: int = 30
+    market_radar_days: int = 90
     vacuum: bool = True
 
 
@@ -45,6 +47,10 @@ def prune(db_path: str, policy: RetentionPolicy | None = None) -> dict:
             conn, "spot_ticks", "captured_at", pol.spot_ticks_days)
         result["signals_deleted"] = _delete_old(
             conn, "signals", "captured_at", pol.signals_days)
+        result["market_snapshots_deleted"] = _delete_old(
+            conn, "market_snapshots", "captured_at", pol.market_snapshots_days)
+        result["market_radar_deleted"] = _delete_old(
+            conn, "market_radar_candidates", "captured_at", pol.market_radar_days)
 
         if pol.vacuum:
             log.info("VACUUM started")

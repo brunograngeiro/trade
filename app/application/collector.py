@@ -17,12 +17,13 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from app.config import Settings
-from app.domain.entities import Market, MarketPhase, Signal, SignalKind, Tick
+from app.domain.entities import Market, MarketPhase, Side, Signal, SignalKind, Tick
 from app.infrastructure.coinbase.client import CoinbaseClient, SpotTick
 from app.infrastructure.db.sqlite import Database
 from app.infrastructure.kalshi.client import KalshiClient
 from app.infrastructure.kalshi.mapper import market_from_payload, tick_from_market
 from app.application.market_discovery import current_market
+from app.application.decision import DecisionConfig, DecisionEngine, StrategyDecision
 from app.application.signals import SignalConfig, SignalEngine
 
 
@@ -67,7 +68,7 @@ class Collector:
     """Background loop that ingests ticks and computes signals."""
 
     def __init__(self, settings: Settings, client: KalshiClient, db: Database,
-                 on_tick: Callable[[Tick, Market, Signal], Awaitable[None]] | None = None,
+                 on_tick: Callable[[Tick, Market, Signal, StrategyDecision | None], Awaitable[None]] | None = None,
                  coinbase: CoinbaseClient | None = None) -> None:
         self.settings = settings
         self.client = client
@@ -78,6 +79,25 @@ class Collector:
             explosion_delta=settings.prob_explosion_delta,
             plateau_threshold=settings.prob_plateau_threshold,
             plateau_seconds=settings.prob_plateau_seconds,
+            extreme_close_prob=settings.extreme_close_prob,
+            extreme_close_ttc_seconds=settings.extreme_close_ttc_seconds,
+            extreme_close_persistence_seconds=settings.extreme_close_persistence_seconds,
+        ))
+        self.decisions = DecisionEngine(DecisionConfig(
+            enabled=settings.strategy_decisions_enabled,
+            entry_confidence_floor=settings.entry_confidence_floor,
+            entry_persistence_seconds=settings.entry_persistence_seconds,
+            entry_ttc_seconds=settings.entry_ttc_seconds,
+            late_cross_ttc_seconds=settings.late_cross_ttc_seconds,
+            flip_cross_ttc_seconds=settings.flip_cross_ttc_seconds,
+            extreme_close_ttc_seconds=settings.extreme_close_ttc_seconds,
+            max_entry_price_180s_cents=settings.max_entry_price_180s_cents,
+            max_entry_price_60s_cents=settings.max_entry_price_60s_cents,
+            max_entry_price_30s_cents=settings.max_entry_price_30s_cents,
+            spot_guard_enabled=settings.spot_guard_enabled,
+            spot_guard_buffer_dollars=settings.spot_guard_buffer_dollars,
+            spot_guard_momentum_seconds=settings.spot_guard_momentum_seconds,
+            spot_guard_momentum_dollars=settings.spot_guard_momentum_dollars,
         ))
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
@@ -85,6 +105,7 @@ class Collector:
         self.last_tick: Tick | None = None
         self.last_market: Market | None = None
         self.last_signal: Signal | None = None
+        self.last_decision: StrategyDecision | None = None
         self.last_spot: SpotTick | None = None
         self.health = CollectorHealth()
 
@@ -137,6 +158,34 @@ class Collector:
                 self.health.consecutive_failures = 0
         log.info("Collector stopped")
 
+    async def _hydrate_position(self, ticker: str) -> None:
+        """Query Kalshi for any open position on `ticker` and sync the
+        DecisionEngine's in-memory `_position_side` with reality. Without this
+        a service restart silently loses the position state — the engine would
+        miss exit/flip signals and could double-enter on the next ENTER.
+        Best-effort: API errors are logged and ignored (engine stays empty)."""
+        try:
+            payload = await self.client.get_positions(limit=100)
+        except Exception:  # noqa: BLE001
+            log.exception("Failed to hydrate position from Kalshi (non-fatal)")
+            return
+
+        market_positions = payload.get("market_positions") or []
+        held_side: Side | None = None
+        for pos in market_positions:
+            if pos.get("ticker") != ticker:
+                continue
+            qty = float(pos.get("position_fp", pos.get("position", 0)) or 0)
+            if qty > 0:
+                held_side = Side.YES
+            elif qty < 0:
+                held_side = Side.NO
+            break
+
+        if held_side is not None:
+            log.info("Hydrated position for %s: holding %s", ticker, held_side.value)
+        self.decisions.set_position(held_side)
+
     def _record_failure(self, reason: str) -> None:
         self.health.failures += 1
         self.health.consecutive_failures += 1
@@ -162,7 +211,9 @@ class Collector:
             log.info("New market: %s (%s..%s)",
                      market.ticker, market.open_time.isoformat(), market.close_time.isoformat())
             self.engine.reset()
+            self.decisions.reset()
             self._current_ticker = market.ticker
+            await self._hydrate_position(market.ticker)
 
         latest = await self.client.get_market(market.ticker)
         if latest.get("market"):
@@ -172,6 +223,7 @@ class Collector:
         self.db.save_tick(tick)
         now = datetime.now(timezone.utc)
         phase = market.phase_at(now)
+        ttc_seconds = max(0.0, (market.close_time - now).total_seconds())
 
         if self.coinbase is not None:
             try:
@@ -183,7 +235,14 @@ class Collector:
             except Exception:  # noqa: BLE001
                 log.exception("Coinbase fetch failed (non-fatal)")
 
-        signal = self.engine.evaluate(tick, phase)
+        signal = self.engine.evaluate(tick, phase, ttc_seconds=ttc_seconds)
+        decision = self.decisions.evaluate(
+            tick, market, signal, ttc_seconds,
+            spot_price=self.last_spot.price if self.last_spot else None,
+            spot_captured_at=self.last_spot.captured_at if self.last_spot else None,
+        )
+        if decision.action.value in {"enter", "exit", "flip"} or decision.crossed_50:
+            self.db.save_strategy_decision(decision)
 
         # Apply phase filter: signal is only "actionable" if phase matches
         actionable = True
@@ -198,9 +257,10 @@ class Collector:
         self.last_tick = tick
         self.last_market = market
         self.last_signal = signal
+        self.last_decision = decision
         self.health.last_tick_at = now
         self.health.current_ticker = market.ticker
         self.health.current_phase = phase.value
 
         if self.on_tick:
-            await self.on_tick(tick, market, signal)
+            await self.on_tick(tick, market, signal, decision)

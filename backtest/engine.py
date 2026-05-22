@@ -10,15 +10,40 @@ Entry price uses the side's ask (worst-case cross-the-book).
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections import defaultdict
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from statistics import mean
 from typing import Iterable
 
 from app.application.signals import SignalConfig, SignalEngine
 from app.domain.entities import Side, SignalKind, Tick
+
+
+_TICKER_TIME_RE = re.compile(r"KXBTC15M-(\d{2})([A-Z]{3})(\d{2})(\d{2})(\d{2})")
+_MONTHS = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+
+
+def close_time_from_ticker(ticker: str) -> datetime | None:
+    """Parse KXBTC15M-26MAY161745-45 -> close datetime (UTC, naive).
+
+    Kalshi names the ticker in US Eastern Time. For the May 2026 dataset
+    that's EDT (UTC-4). Returns naive UTC datetime.
+    """
+    m = _TICKER_TIME_RE.match(ticker)
+    if not m:
+        return None
+    yy, mon, dd, hh, mm = m.groups()
+    et = datetime(
+        year=2000 + int(yy), month=_MONTHS[mon], day=int(dd),
+        hour=int(hh), minute=int(mm), second=0,
+    )
+    return et + timedelta(hours=4)
 
 
 @dataclass
@@ -32,6 +57,13 @@ class BacktestParams:
     apply_fees_both_sides: bool = True  # exit/expiry also charges
     min_phase: str | None = None  # "early"|"middle"|"late" to restrict entries
     slippage_cents: int = 0  # extra cents added to entry price
+    # Extreme-close (calibration-derived) — defaults from scripts/calibration_ttc.py
+    extreme_close_prob: float = 0.90
+    extreme_close_ttc_seconds: float = 180.0
+    extreme_close_persistence_seconds: float = 30.0
+    # Restrict to a specific signal kind (None = any). Use this to A/B the new
+    # EXTREME_CLOSE rule in isolation.
+    only_signal_kind: str | None = None
 
 
 def kalshi_fee_dollars(price_dollars: float, count: int, rate: float = 0.07) -> float:
@@ -89,15 +121,22 @@ def run_backtest(db_path: str, params: BacktestParams) -> dict:
         plateau_threshold=params.plateau_threshold,
         plateau_seconds=params.plateau_seconds,
         explosion_window_seconds=params.explosion_window_seconds,
+        extreme_close_prob=params.extreme_close_prob,
+        extreme_close_ttc_seconds=params.extreme_close_ttc_seconds,
+        extreme_close_persistence_seconds=params.extreme_close_persistence_seconds,
     ))
 
     for ticker, ticks in by_ticker.items():
         engine.reset()
         window = markets_meta.get(ticker)
+        close_t = close_time_from_ticker(ticker)
         for tick in ticks:
             phase = _phase_for(window, tick.captured_at)
-            signal = engine.evaluate(tick, phase)
+            ttc = _ttc_for(close_t, tick.captured_at)
+            signal = engine.evaluate(tick, phase, ttc_seconds=ttc)
             if signal.kind == SignalKind.NONE:
+                continue
+            if params.only_signal_kind and signal.kind.value != params.only_signal_kind:
                 continue
             if params.min_phase and phase.value != params.min_phase:
                 # phase restriction: only enter in the chosen phase
@@ -159,16 +198,25 @@ def run_backtest_for_tickers(db_path: str, params: BacktestParams,
         plateau_threshold=params.plateau_threshold,
         plateau_seconds=params.plateau_seconds,
         explosion_window_seconds=params.explosion_window_seconds,
+        extreme_close_prob=params.extreme_close_prob,
+        extreme_close_ttc_seconds=params.extreme_close_ttc_seconds,
+        extreme_close_persistence_seconds=params.extreme_close_persistence_seconds,
     ))
 
     trades: list[Trade] = []
     for ticker, ticks in by_ticker.items():
         engine.reset()
         window = markets_meta.get(ticker)
+        close_t = close_time_from_ticker(ticker)
         for tick in ticks:
             phase = _phase_for(window, tick.captured_at)
-            signal = engine.evaluate(tick, phase)
+            ttc = _ttc_for(close_t, tick.captured_at)
+            signal = engine.evaluate(tick, phase, ttc_seconds=ttc)
             if signal.kind == SignalKind.NONE:
+                continue
+            if params.only_signal_kind and signal.kind.value != params.only_signal_kind:
+                continue
+            if params.min_phase and phase.value != params.min_phase:
                 continue
             trades.append(_settle(tick, signal, resolutions.get(ticker), params))
             break
@@ -183,6 +231,14 @@ def _market_windows(conn: sqlite3.Connection) -> dict[str, tuple[datetime, datet
     ).fetchall()
     return {r["ticker"]: (datetime.fromisoformat(r["first"]),
                           datetime.fromisoformat(r["last"])) for r in rows}
+
+
+def _ttc_for(close_t: datetime | None, when: datetime) -> float | None:
+    """Time-to-close in seconds (positive while open). Naive UTC arithmetic."""
+    if close_t is None:
+        return None
+    captured = when.replace(tzinfo=None) if when.tzinfo else when
+    return (close_t - captured).total_seconds()
 
 
 def _phase_for(window: tuple[datetime, datetime] | None, when: datetime) -> "object":

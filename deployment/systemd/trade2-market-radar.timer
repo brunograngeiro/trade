@@ -1,0 +1,12 @@
+[Unit]
+Description=trade2 — daily Kalshi market radar timer
+Requires=trade2-market-radar.service
+
+[Timer]
+OnCalendar=*-*-* 12:10:00 UTC
+Persistent=true
+RandomizedDelaySec=900
+Unit=trade2-market-radar.service
+
+[Install]
+WantedBy=timers.target

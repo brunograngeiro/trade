@@ -35,6 +35,7 @@ class Side(str, Enum):
 class SignalKind(str, Enum):
     EXPLOSION = "explosion"
     PLATEAU = "plateau"
+    EXTREME_CLOSE = "extreme_close"
     NONE = "none"
 
 
@@ -96,6 +97,7 @@ class Signal:
     probability: float
     delta: float
     notes: str
+    ttc_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +109,8 @@ class OrderRequest:
     limit_price_cents: int
     client_order_id: str
     dry_run: bool
+    time_in_force: str | None = None
+    reduce_only: bool = False
 
 
 @dataclass(frozen=True)
