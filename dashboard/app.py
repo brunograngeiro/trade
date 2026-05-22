@@ -79,6 +79,33 @@ def _yes_mid(row: sqlite3.Row) -> float | None:
     return row["last_price"]
 
 
+def _render_chat_chart(rows: list[dict], chart: dict | None) -> None:
+    if not rows or not chart:
+        return
+    df = pd.DataFrame(rows)
+    x_col = chart.get("x")
+    y_cols = [col for col in chart.get("y", []) if col in df.columns]
+    if x_col not in df.columns or not y_cols:
+        return
+
+    fig = go.Figure()
+    chart_type = chart.get("type", "line")
+    for col in y_cols:
+        series = pd.to_numeric(df[col], errors="coerce")
+        if chart_type == "bar":
+            fig.add_trace(go.Bar(x=df[x_col], y=series, name=col))
+        else:
+            fig.add_trace(go.Scatter(x=df[x_col], y=series, name=col, mode="lines+markers"))
+    fig.update_layout(
+        title=chart.get("title") or "Grafico",
+        xaxis_title=x_col,
+        yaxis_title=", ".join(y_cols),
+        margin=dict(l=10, r=10, t=45, b=10),
+        legend=dict(orientation="h"),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def _regime(prob: float) -> str:
     confidence = max(prob, 1.0 - prob)
     if 0.40 <= prob <= 0.60:
@@ -510,6 +537,7 @@ with tabs[3]:
             st.session_state["analyst_conversation_id"] = answer["conversation_id"]
             with st.chat_message("assistant"):
                 st.markdown(answer["answer"])
+                _render_chat_chart(answer.get("rows", []), answer.get("chart"))
                 if answer.get("sql"):
                     with st.expander("SQL e resultado"):
                         st.code(answer["sql"], language="sql")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -510,6 +511,7 @@ async def analytics_chat(body: dict) -> dict:
             "sql": None,
             "rows": report["data"].get("folds") or report["data"].get("rows") or [],
             "columns": [],
+            "chart": _chart_spec_for_report(report),
         }
 
     root = Path(__file__).resolve().parents[2]
@@ -527,6 +529,8 @@ async def analytics_chat(body: dict) -> dict:
                 "Classifique a pergunta do usuario para o projeto trade2. "
                 "Se precisar consultar dados tabulares atuais, responda JSON "
                 "{\"mode\":\"sql\",\"sql\":\"SELECT ...\"}. "
+                "Se o usuario pedir grafico de dados, tambem use mode=sql; "
+                "o dashboard desenhara o grafico a partir das linhas retornadas. "
                 "Se for pergunta sobre codigo, estrategia, explicacao ou opiniao, responda JSON "
                 "{\"mode\":\"answer\",\"answer\":\"...\"}. "
                 "Para SQL use apenas SQLite SELECT/WITH, sem markdown e sem ponto e virgula. "
@@ -580,6 +584,7 @@ async def analytics_chat(body: dict) -> dict:
 
     s.db.save_analyst_message(conversation_id, "assistant", answer,
                               provider=provider, metadata=metadata)
+    chart = _chart_spec_from_rows(question, rows, columns)
     return {
         "conversation_id": conversation_id,
         "provider": provider,
@@ -588,6 +593,7 @@ async def analytics_chat(body: dict) -> dict:
         "sql": sql,
         "rows": rows,
         "columns": columns,
+        "chart": chart,
     }
 
 
@@ -606,6 +612,87 @@ def _parse_chat_decision(content: str) -> dict:
     except json.JSONDecodeError:
         pass
     return {"mode": "answer", "answer": content}
+
+
+def _chart_spec_for_report(report: dict) -> dict | None:
+    name = report.get("name")
+    rows = report.get("data", {}).get("folds") or report.get("data", {}).get("rows") or []
+    if not rows:
+        return None
+    if name == "final_minute":
+        return {
+            "type": "bar",
+            "title": "Minuto final por bucket",
+            "x": "bucket",
+            "y": ["direction_accuracy", "avg_confidence", "pct_near_50"],
+        }
+    if name == "spot_walk_forward":
+        return {
+            "type": "line",
+            "title": "Spot x probabilidade por fold",
+            "x": "fold",
+            "y": ["avg_corr", "avg_same_direction"],
+        }
+    return None
+
+
+def _chart_spec_from_rows(question: str, rows: list[dict], columns: list[str]) -> dict | None:
+    if not rows or not columns:
+        return None
+    q = question.lower()
+    wants_chart = any(w in q for w in ("grafico", "gráfico", "chart", "plot", "linha", "barras"))
+    if not wants_chart:
+        return None
+
+    x_col = _pick_x_column(rows, columns)
+    y_cols = [
+        col for col in columns
+        if col != x_col and _is_numeric_series([row.get(col) for row in rows])
+    ][:4]
+    if not x_col or not y_cols:
+        return None
+    chart_type = "bar" if any(w in q for w in ("barra", "barras", "bucket", "por motivo", "por reason")) else "line"
+    if len(rows) <= 8 and not any(w in q for w in ("linha", "line")):
+        chart_type = "bar"
+    return {
+        "type": chart_type,
+        "title": "Grafico solicitado",
+        "x": x_col,
+        "y": y_cols,
+    }
+
+
+def _pick_x_column(rows: list[dict], columns: list[str]) -> str | None:
+    preferred = (
+        "captured_at", "submitted_at", "created_at", "date", "day", "bucket",
+        "fold", "ticker", "reason", "decision_reason",
+    )
+    lower_map = {col.lower(): col for col in columns}
+    for name in preferred:
+        if name in lower_map:
+            return lower_map[name]
+    for col in columns:
+        values = [row.get(col) for row in rows[:20]]
+        if not _is_numeric_series(values):
+            return col
+    return columns[0] if columns else None
+
+
+def _is_numeric_series(values: list) -> bool:
+    seen = 0
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, (int, float)):
+            seen += 1
+            continue
+        if isinstance(value, str) and re.fullmatch(r"-?\d+(\.\d+)?", value.strip()):
+            seen += 1
+            continue
+        return False
+    return seen > 0
 
 
 def _preprogrammed_report(question: str, settings) -> dict | None:
