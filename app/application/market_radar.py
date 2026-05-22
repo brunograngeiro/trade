@@ -57,6 +57,7 @@ async def run_market_radar(settings: Settings, client: KalshiClient,
     cursor = None
     scanned = 0
     candidates: list[dict] = []
+    events: dict[str, dict] = {}
 
     for page in range(max(1, cfg.pages)):
         payload = await client.get_markets(
@@ -68,8 +69,12 @@ async def run_market_radar(settings: Settings, client: KalshiClient,
         scanned += len(markets)
         for market in markets:
             candidate = _candidate(market, cfg, captured_at)
-            if candidate is not None:
-                candidates.append(candidate)
+            if candidate is None:
+                continue
+            event = await _event_for_market(client, market, events)
+            if event is not None:
+                _apply_event(candidate, event)
+            candidates.append(candidate)
         cursor = payload.get("cursor")
         if not cursor or not markets:
             break
@@ -93,8 +98,23 @@ async def run_market_radar(settings: Settings, client: KalshiClient,
     }
 
 
+async def _event_for_market(client: KalshiClient, market: dict[str, Any],
+                            cache: dict[str, dict]) -> dict | None:
+    event_ticker = market.get("event_ticker")
+    if not event_ticker:
+        return None
+    if event_ticker not in cache:
+        try:
+            payload = await client.get_event(event_ticker)
+            cache[event_ticker] = payload.get("event") or {}
+        except Exception as exc:  # noqa: BLE001
+            log.warning("market_radar event fetch failed event=%s error=%s", event_ticker, exc)
+            cache[event_ticker] = {}
+    return cache[event_ticker] or None
+
+
 def _candidate(market: dict[str, Any], cfg: RadarConfig,
-               now: datetime) -> dict | None:
+               now: datetime, *, event: dict | None = None) -> dict | None:
     yes_bid = _to_float(market.get("yes_bid_dollars"))
     yes_ask = _to_float(market.get("yes_ask_dollars"))
     no_bid = _to_float(market.get("no_bid_dollars"))
@@ -131,13 +151,26 @@ def _candidate(market: dict[str, Any], cfg: RadarConfig,
         ttc_seconds=ttc_seconds,
         focus_ttc_days=cfg.focus_ttc_days,
     )
+    market_title = market.get("title")
+    event_title = event.get("title") if event else None
+    event_sub_title = event.get("sub_title") if event else None
+    category = market.get("category") or (event.get("category") if event else None)
+    series_ticker = market.get("series_ticker") or (event.get("series_ticker") if event else None)
+    display_title = event_title or market_title
+    if event_sub_title and display_title and event_sub_title not in display_title:
+        display_title = f"{display_title} - {event_sub_title}"
+
     return {
         "score": round(score, 4),
         "ticker": market.get("ticker"),
         "event_ticker": market.get("event_ticker"),
-        "series_ticker": market.get("series_ticker"),
-        "title": market.get("title"),
-        "category": market.get("category"),
+        "series_ticker": series_ticker,
+        "title": display_title,
+        "category": category,
+        "event_title": event_title,
+        "event_sub_title": event_sub_title,
+        "market_title": market_title,
+        "slug": market.get("ticker"),
         "close_time": market.get("close_time"),
         "ttc_seconds": ttc_seconds,
         "yes_bid": yes_bid,
@@ -152,6 +185,21 @@ def _candidate(market: dict[str, Any], cfg: RadarConfig,
         "status": market.get("status"),
         "raw": json.dumps(market, separators=(",", ":")),
     }
+
+
+def _apply_event(candidate: dict, event: dict) -> None:
+    event_title = event.get("title")
+    event_sub_title = event.get("sub_title")
+    display_title = event_title or candidate.get("title")
+    if event_sub_title and display_title and event_sub_title not in display_title:
+        display_title = f"{display_title} - {event_sub_title}"
+    candidate.update({
+        "title": display_title,
+        "category": candidate.get("category") or event.get("category"),
+        "event_title": event_title,
+        "event_sub_title": event_sub_title,
+        "series_ticker": candidate.get("series_ticker") or event.get("series_ticker"),
+    })
 
 
 def _score(volume: int, liquidity: int, spread_cents: float, yes_mid: float,

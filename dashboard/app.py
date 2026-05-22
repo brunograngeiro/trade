@@ -447,10 +447,17 @@ with tabs[2]:
         if category:
             view = view[view["category"].isin(category)]
 
+        if "market_title" not in view.columns:
+            view["market_title"] = view["title"]
+        if "slug" not in view.columns:
+            view["slug"] = view["ticker"]
+
         cols = [
-            "rank", "score", "ticker", "title", "category", "ttc_h",
-            "yes_mid_pct", "spread_cents", "volume", "liquidity", "close_time",
+            "rank", "score", "title", "market_title", "category", "slug",
+            "event_ticker", "series_ticker", "ttc_h", "yes_mid_pct",
+            "spread_cents", "volume", "liquidity", "close_time",
         ]
+        cols = [c for c in cols if c in view.columns]
         st.dataframe(
             view[cols],
             use_container_width=True,
@@ -460,6 +467,7 @@ with tabs[2]:
                 "ttc_h": st.column_config.NumberColumn("TTC h", format="%.1f"),
                 "yes_mid_pct": st.column_config.NumberColumn("YES %", format="%.1f"),
                 "spread_cents": st.column_config.NumberColumn("spread c", format="%.1f"),
+                "liquidity": st.column_config.NumberColumn("liquidity", format="$%d"),
             },
         )
 
@@ -471,8 +479,14 @@ with tabs[2]:
                 hdf["close_time"] = pd.to_datetime(hdf["close_time"], errors="coerce")
                 hdf["ttc_h"] = hdf["ttc_seconds"] / 3600
                 hdf["yes_mid_pct"] = hdf["yes_mid"] * 100
-                hcols = ["captured_at", "scan_id", "rank", "score", "ticker",
-                         "yes_mid_pct", "spread_cents", "volume", "ttc_h", "title"]
+                if "market_title" not in hdf.columns:
+                    hdf["market_title"] = hdf["title"]
+                if "slug" not in hdf.columns:
+                    hdf["slug"] = hdf["ticker"]
+                hcols = ["captured_at", "scan_id", "rank", "score", "title",
+                         "market_title", "category", "slug", "yes_mid_pct",
+                         "spread_cents", "volume", "liquidity", "ttc_h"]
+                hcols = [c for c in hcols if c in hdf.columns]
                 st.dataframe(
                     hdf[hcols],
                     use_container_width=True,

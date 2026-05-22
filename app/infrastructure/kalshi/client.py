@@ -49,6 +49,9 @@ class KalshiClient:
     async def get_market(self, ticker: str) -> dict:
         return await self._public("GET", f"/markets/{ticker}")
 
+    async def get_event(self, event_ticker: str) -> dict:
+        return await self._public("GET", f"/events/{event_ticker}")
+
     async def get_orderbook(self, ticker: str, depth: int = 5) -> dict:
         return await self._public("GET", f"/markets/{ticker}/orderbook", params={"depth": depth})
 

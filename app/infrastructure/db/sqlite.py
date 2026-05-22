@@ -152,6 +152,10 @@ CREATE TABLE IF NOT EXISTS market_radar_candidates (
     series_ticker TEXT,
     title TEXT,
     category TEXT,
+    event_title TEXT,
+    event_sub_title TEXT,
+    market_title TEXT,
+    slug TEXT,
     close_time TEXT,
     ttc_seconds REAL,
     yes_bid REAL,
@@ -179,6 +183,23 @@ class Database:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._ensure_columns(conn)
+
+    def _ensure_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(market_radar_candidates)")
+        }
+        for name, column_type in {
+            "event_title": "TEXT",
+            "event_sub_title": "TEXT",
+            "market_title": "TEXT",
+            "slug": "TEXT",
+        }.items():
+            if name not in existing:
+                conn.execute(
+                    f"ALTER TABLE market_radar_candidates ADD COLUMN {name} {column_type}"
+                )
 
     @contextmanager
     def connect(self):
@@ -325,10 +346,11 @@ class Database:
             conn.executemany(
                 """INSERT INTO market_radar_candidates
                    (scan_id, captured_at, rank, score, ticker, event_ticker,
-                    series_ticker, title, category, close_time, ttc_seconds,
+                    series_ticker, title, category, event_title, event_sub_title,
+                    market_title, slug, close_time, ttc_seconds,
                     yes_bid, yes_ask, no_bid, no_ask, yes_mid, spread_cents,
                     volume, liquidity, open_interest, status, raw)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (
                         r["scan_id"],
@@ -340,6 +362,10 @@ class Database:
                         r.get("series_ticker"),
                         r.get("title"),
                         r.get("category"),
+                        r.get("event_title"),
+                        r.get("event_sub_title"),
+                        r.get("market_title"),
+                        r.get("slug"),
                         r.get("close_time"),
                         r.get("ttc_seconds"),
                         r.get("yes_bid"),
