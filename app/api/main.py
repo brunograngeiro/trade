@@ -131,7 +131,7 @@ async def lifespan(app: FastAPI):
                     else:
                         buy_result = await state.orders.submit(buy_req)
                         order_results.append(buy_result)
-                        if _order_filled(buy_result):
+                        if _order_filled(buy_result) or buy_result.ok:
                             state.collector.decisions.set_position(decision.side)
                         else:
                             state.collector.decisions.set_position(None)
